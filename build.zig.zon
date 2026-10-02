@@ -1,0 +1,55 @@
+.{
+    // The name a dependent package writes in `b.dependency("lmdb", .{})`,
+    // and the prefix of the module it then reaches through
+    // `dep.module("lmdb")`.
+    .name = .lmdb,
+    // The upstream LMDB release this fork carries. lmdb.h:235-239 declares
+    // MDB_VERSION_MAJOR/MINOR/PATCH as 1, 0 and 1 at that commit, and
+    // build.zig refuses to configure if this string drifts away from the
+    // version it pins there.
+    .version = "1.0.1",
+    // Identifies this package unambiguously. Changing this has security and
+    // trust implications.
+    .fingerprint = 0xb2966103cdac27b5,
+    .minimum_zig_version = "0.16.0",
+    // The library is the three upstream C translation units in this
+    // repository. There is no Zig dependency and there is nothing to fetch at
+    // build time.
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        // The aggregate header handed to addTranslateC. It is fork-authored
+        // and lives at the package root, so the upstream tree under
+        // libraries/liblmdb stays byte-for-byte upstream's.
+        "translate.h",
+        // The Zig facade, and its behavioural tests and deterministic smoke
+        // program.
+        "zig",
+        "tests.zig",
+        "smoke.zig",
+        // cross-test reads this settings-only profile from the package root to
+        // drive `zig build test -Dtarget=TARGET` over the full published
+        // platform matrix. It is Bash, not documentation, so it is listed.
+        "cross-test.profile.sh",
+        // Tests read a known-answer corpus from here with @embedFile, and
+        // testdata/interop.zig is the reference interoperability program: the
+        // `check` step compiles it for every target of the matrix, and the
+        // `interop` step runs it against an upstream mdb_dump built from this
+        // same package.
+        "testdata",
+        // The separate consumer package. It lives inside this repository so the
+        // dependency it proves is a relative path that resolves without a
+        // registry entry or a network fetch.
+        "consumer",
+        // Full pinned native library, tools, headers, build definitions and
+        // legal records. UPSTREAM.sha256 covers the same immutable tree.
+        "libraries/liblmdb",
+        "UPSTREAM.md",
+        "UPSTREAM.sha256",
+        "README.zig.md",
+        "FORK-NOTES.md",
+        "CHANGELOG.md",
+        "NOTICE.md",
+    },
+}

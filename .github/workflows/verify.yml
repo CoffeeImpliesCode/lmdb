@@ -1,0 +1,350 @@
+# Verification for this fork.
+#
+# LMDB ships no GitHub Actions workflow: there was no upstream file to
+# retarget, so this one is written for this repository and names this
+# repository's gates.
+#
+# Six jobs, six different questions:
+#
+#   licence      is the imported tree still the bytes upstream published: the
+#                43 records of UPSTREAM.sha256 - upstream's whole
+#                libraries/liblmdb, the licence and copyright files among
+#                them, and the one independent fixture - checked file by file
+#   native       does it build, does the installed header compile, link and run
+#                against the installed archive - the whole of it, core and
+#                dynamic-module loader alike - do the behavioural tests pass in
+#                both optimize modes, does the smoke program produce its
+#                output on this host, and does what the facade wrote read back
+#                byte for byte through upstream's own mdb_dump
+#   matrix       does `zig build check` compile the C core, the facade, the tests,
+#                the smoke program and the interoperability program for every
+#                supported target, and does it re-derive that wasm32-wasi is
+#                refused
+#   cross        does one named target compile on its own, so a failure is
+#                attributable to a target rather than to the sweep
+#   wasm32-wasi  is the sixth row of the matrix. It has no shared-lock backend,
+#                so the gate asserts that the build refuses it with the
+#                documented reason. It is NOT continue-on-error and it does not
+#                accept any failure: a non-zero exit that does not carry that
+#                reason fails the job, and a zero exit fails the job too.
+#   consumer     does the exported module resolve, and work, from a package that
+#                did not write it
+#
+# The cross matrix below is deliberately the five targets this build names a
+# lock backend for. wasm32-wasi is in its own job because it is a different
+# kind of result, and hiding it inside a matrix would make a genuine refusal
+# indistinguishable from a flaky runner.
+
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  licence:
+    name: upstream closure digests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # UPSTREAM.sha256 is a SHA-256 record of every file this fork carries
+      # from LMDB at tag LMDB_1.0.1: all 42 files of upstream's own
+      # libraries/liblmdb, the licence and copyright files among them, and
+      # the one independent fixture, testdata/corpus.txt. It is the licence
+      # condition as a check rather than as a sentence. The OpenLDAP Public
+      # License allows redistribution only if the notices travel with the
+      # sources, and a digest of the file that carries a notice cannot be
+      # satisfied by some other file asserting that it is there. The same
+      # record covers the C sources the archive is built from and the
+      # fixture the behavioural tests read, so an edit to any of them fails
+      # here whether or not a build step noticed it.
+      #
+      # `sha256sum -c` skips the record's comment header, checks every line
+      # against the working tree, and exits non-zero if a file is missing or
+      # a byte differs. It runs at the repository root because the record's
+      # paths are written from there, and this checkout is that root.
+      - name: upstream closure
+        run: sha256sum -c UPSTREAM.sha256
+
+  native:
+    name: native build, tests, smoke and interoperability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: build
+        run: zig build
+
+      # A real gate for the installed C surface: this translation unit includes
+      # the installed header, calls the environment, transaction, database and
+      # value APIs, and links against the installed archive. A declaration the
+      # header gets wrong fails to compile; a symbol the archive does not define
+      # fails to link. It then runs and decides three things by behaviour: a
+      # value written in a committed transaction reads back byte for byte in a
+      # second, read-only transaction; a module that is not there is refused
+      # with a reason; and every handle the program took is released, on the
+      # failing paths as well as the passing one.
+      #
+      # The scratch directory is the program's own. `mdb_env_open` does not
+      # create the directory it is handed - mdb.c contains no mkdir - so the
+      # program creates exactly the child it was told to open, and nothing
+      # above it or beside it.
+      #
+      # `-pthread -ldl` is the link line upstream's own lmdb.pc records:
+      # `Libs: -llmdb -ldl -pthread` (liblmdb/Makefile:158), assembled from
+      # `THREADS = -pthread` (liblmdb/Makefile:24) and `LDL = -ldl`
+      # (liblmdb/Makefile:31). `-ldl` is here because the archive contains
+      # module.o, which calls dlopen: the loader call below is what makes the
+      # linker pull that object out of the archive at all.
+      - name: installed C header and archive interoperate
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/c_surface.c" <<'C'
+          #include <lmdb.h>
+          #include <errno.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/stat.h>
+
+          /* Every step below leaves through `out`, so a failure anywhere
+             releases whatever is still held. A committed transaction is spent
+             by contract, so `txn` is cleared the moment it commits and the
+             exit never aborts a handle that no longer exists. */
+          int main(void)
+          {
+              static const char key[] = "gate";
+              static const char value[] = "installed-lmdb";
+              MDB_env *env = NULL;
+              MDB_txn *txn = NULL;
+              MDB_crypto_funcs *mcf = NULL;
+              MDB_dbi dbi;
+              MDB_val k, v, got;
+              void *mlm;
+              char *moderr = NULL;
+              char path[4096];
+              char absent[4096];
+              const char *base = getenv("LMDB_GATE_DIR");
+              int step = 0;
+              int rc = MDB_SUCCESS;
+
+              if (!base)
+                  base = ".";
+              snprintf(path, sizeof path, "%s/lmdb-c-surface", base);
+              snprintf(absent, sizeof absent,
+                       "%s/lmdb-c-surface/absent.so", base);
+
+              /* mdb_env_open needs that directory to exist first. This is
+                 the one path the program owns, inside the base it was given,
+                 and the module path below is inside it, so the loader can
+                 only be asked for a file that is not there. */
+              if (mkdir(path, 0700) != 0 && errno != EEXIST) {
+                  fprintf(stderr, "gate: cannot create %s: %s\n",
+                          path, strerror(errno));
+                  return 9;
+              }
+
+              if ((rc = mdb_env_create(&env)) != MDB_SUCCESS) { step = 10; goto out; }
+              if ((rc = mdb_env_set_maxdbs(env, 2)) != MDB_SUCCESS) { step = 11; goto out; }
+              if ((rc = mdb_env_set_mapsize(env, 1u << 20)) != MDB_SUCCESS) { step = 12; goto out; }
+              if ((rc = mdb_env_open(env, path, 0, 0644)) != MDB_SUCCESS) { step = 13; goto out; }
+
+              /* First transaction: write, commit. */
+              if ((rc = mdb_txn_begin(env, NULL, 0, &txn)) != MDB_SUCCESS) { step = 14; goto out; }
+              if ((rc = mdb_dbi_open(txn, NULL, 0, &dbi)) != MDB_SUCCESS) { step = 15; goto out; }
+              k.mv_size = sizeof key - 1;  k.mv_data = (void *)key;
+              v.mv_size = sizeof value - 1; v.mv_data = (void *)value;
+              if ((rc = mdb_put(txn, dbi, &k, &v, 0)) != MDB_SUCCESS) { step = 16; goto out; }
+              rc = mdb_txn_commit(txn);
+              txn = NULL; /* consumed on success or failure, lmdb.h:1192 */
+              if (rc != MDB_SUCCESS) { step = 17; goto out; }
+
+              /* Second transaction: read it back, byte for byte. */
+              if ((rc = mdb_txn_begin(env, NULL, MDB_RDONLY, &txn)) != MDB_SUCCESS) { step = 18; goto out; }
+              if ((rc = mdb_get(txn, dbi, &k, &got)) != MDB_SUCCESS) { step = 19; goto out; }
+              if (got.mv_size != sizeof value - 1 ||
+                  memcmp(got.mv_data, value, got.mv_size) != 0) { step = 20; goto out; }
+
+              /* liblmdb.a is mdb.o midl.o module.o (liblmdb/Makefile:87-88),
+                 and module.o is the unit that calls dlopen/dlsym/dlclose.
+                 Calling the loader is what makes the linker pull that object
+                 out of the archive and resolve its dl* calls against the -ldl
+                 above, and unlike naming the symbol it decides something: a
+                 module that cannot be opened must come back as no handle and
+                 a reason, which is the loader's contract for one (module.c:
+                 51-66). The path names a file this program never creates, so
+                 nothing is loaded and there is no handle to unload, and the
+                 message belongs to the loader, so it is read, not freed. */
+              mlm = mdb_modload(absent, "MDB_crypto", &mcf, &moderr);
+              if (mlm != NULL) { step = 21; goto out; }
+              if (moderr == NULL) { step = 22; goto out; }
+              printf("module loader refused a module that is not there: %s\n",
+                     moderr);
+
+          out:
+              if (txn)
+                  mdb_txn_abort(txn);
+              if (env)
+                  mdb_env_close(env);
+              if (step) {
+                  if (rc != MDB_SUCCESS)
+                      fprintf(stderr, "gate: step %d failed: %s\n",
+                              step, mdb_strerror(rc));
+                  else
+                      fprintf(stderr, "gate: step %d failed\n", step);
+                  return step;
+              }
+              printf("installed lmdb.h and liblmdb.a interoperate\n");
+              return 0;
+          }
+          C
+          mkdir -p "$RUNNER_TEMP/lmdb-gate"
+          LMDB_GATE_DIR="$RUNNER_TEMP/lmdb-gate" \
+          zig cc -std=gnu17 -pthread -ldl \
+            -I zig-out/include \
+            "$RUNNER_TEMP/c_surface.c" \
+            zig-out/lib/liblmdb.a \
+            -o "$RUNNER_TEMP/c_surface"
+          LMDB_GATE_DIR="$RUNNER_TEMP/lmdb-gate" "$RUNNER_TEMP/c_surface"
+
+      # Two optimize modes on purpose. Debug is where the C core is built with
+      # the bounds and overflow checks on, and ReleaseSafe is the mode a
+      # consumer of this package is most likely to ship. A binding that passes
+      # in one and fails in the other has a defect the other mode hides.
+      - name: test (Debug)
+        run: zig build test
+
+      - name: test (ReleaseSafe)
+        run: zig build test -Doptimize=ReleaseSafe
+
+      - name: smoke
+        run: zig build smoke
+
+      # The primary fixture. Upstream's own dump tool, built from the sources
+      # in this repository and linked against the same archive, reads the
+      # environment this facade wrote, and the two bodies are compared byte for
+      # byte. Neither half is this package's wrapper, which is what makes this
+      # a fixture and not another round trip.
+      - name: interoperability with upstream mdb_dump
+        run: zig build interop
+
+  matrix:
+    name: check the whole target matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # One invocation that walks every supported target and, at configure time,
+      # re-derives the partition between the supported and the refused rows.
+      # The per-target `cross` job below says which target failed; this one says
+      # that the sweep itself is complete.
+      - name: compile everything for the matrix
+        run: zig build check --summary all
+
+  cross:
+    name: check ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The five targets this build names a shared-lock backend for. wasm32-wasi
+        # is deliberately absent here and has its own job: it is refused, not
+        # built, and putting it in this matrix would only hide which it is.
+        target:
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
+          - aarch64-macos-none
+          - x86_64-windows-gnu
+          - riscv64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: compile everything for this target
+        run: zig build check -Dtarget=${{ matrix.target }} --summary all
+
+  wasm32-wasi:
+    name: wasm32-wasi is refused with the documented reason
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # The reason, recorded here so this file is also the record of it: LMDB
+      # needs exactly one shared-lock implementation, mdb.c offers four (native
+      # Win32, process-shared POSIX mutex, POSIX named semaphore, SysV
+      # semaphore). WASI's optional mmap emulation is a private snapshot with
+      # no shared file write-back/msync or independent-process robust locking.
+      # MDB_NOLOCK is not a substitute: it is a runtime flag for
+      # mdb_env_set_flags that drops the reader liveness table and the
+      # cross-process write lock, so building against it would produce a weaker
+      # library rather than this one.
+      #
+      # There is no `continue-on-error` on this step and no `|| true`. The build
+      # must fail, and it must fail with that reason. If it ever succeeds, the
+      # matrix changed and this job says so instead of going quietly green.
+      - name: refusal, asserted rather than tolerated
+        run: |
+          set -uo pipefail
+          if output=$(zig build check -Dtarget=wasm32-wasi --summary all 2>&1); then
+            status=0
+          else
+            status=$?
+          fi
+          printf '%s\n' "$output"
+          if [ "$status" -eq 0 ]; then
+            echo "wasm32-wasi is expected to be refused and the build succeeded" >&2
+            echo "Either a backend now exists for it, or the refusal was removed." >&2
+            echo "Move it into the cross matrix and prove it builds in that case." >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$output" | grep -qF "there is no shared-lock backend"; then
+            echo "the build failed, but not for the documented reason:" >&2
+            printf '%s\n' "$output" >&2
+            exit 1
+          fi
+          if printf '%s\n' "$output" | grep -qF "UnsupportedTarget"; then :; else
+            echo "the refusal did not surface as error.UnsupportedTarget" >&2
+            exit 1
+          fi
+          if printf '%s\n' "$output" | grep -qF "no such file or directory"; then
+            echo "the build reached the compiler and failed on a missing header" >&2
+            echo "instead of being refused at configure time" >&2
+            exit 1
+          fi
+          echo "wasm32-wasi is refused with the documented reason"
+
+  consumer:
+    name: consumer package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # The failure this catches is the one the library's own tests cannot see:
+      # a module that builds from the inside and does not resolve from outside.
+      # consumer/build.zig.zon names this package by relative path and its
+      # build.zig asks for dep.module("lmdb") and nothing else.
+      - name: run
+        working-directory: consumer
+        run: zig build run

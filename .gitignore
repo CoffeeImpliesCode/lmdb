@@ -1,0 +1,28 @@
+# `zig build` output. Both are directories because a normal user build creates
+# them, and a normal user build must not dirty this tree or leak into a package
+# published from it.
+.zig-cache/
+zig-out/
+
+# The consumer package builds inside this repository and has its own output
+# tree. It is ignored here as well as in consumer/.gitignore so that a build run
+# from the repository root cannot commit it by accident.
+consumer/.zig-cache/
+consumer/zig-out/
+
+# Upstream's own ignore rules are not restated here and not removed.
+# libraries/liblmdb/.gitignore is upstream's, unmodified: it covers what
+# liblmdb/Makefile drops beside its sources (mtest, mtest2..6, mdb_stat,
+# mdb_copy, mdb_dump, mdb_load, mdb_drop, testdb, *.o, *.lo, *.a, *.so, *.exe,
+# backup and editor droppings, gcov output, core dumps, valgrind output, and
+# the man/ and html/ trees Doxygen writes). None of those patterns is broad
+# enough to swallow a fork-owned path, so nothing above has to be re-included;
+# the one pattern that could ever overlap, `*.a`, only matches the archive this
+# build writes under zig-out/, which is ignored on its own account.
+#
+# This build never produces an upstream artifact in the source directory: it
+# compiles libraries/liblmdb/mdb.c and libraries/liblmdb/midl.c into
+# zig-out/lib, and `zig build interop` builds libraries/liblmdb/mdb_dump.c and
+# libraries/liblmdb/module.c into the Zig cache like everything else. Upstream's
+# `mdb_dump` pattern above is an exact name, so it would not have covered
+# `mdb_dump.c` in any case, and nothing is ever written beside the sources.

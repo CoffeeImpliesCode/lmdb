@@ -1,0 +1,99 @@
+# SHA-256 of every upstream file this repository carries from LMDB LMDB_1.0.1
+# (tag LMDB_1.0.1, commit 6f0a32496a5aadee15a5e5103c479bd3355ae273,
+# https://github.com/LMDB/lmdb), plus the one independent fixture this
+# package's tests read.
+#
+# 43 records, 689093 bytes, in three groups:
+#
+#   42 files   the whole of libraries/liblmdb/, upstream's own liblmdb
+#              directory as imported at that commit. That is the C library
+#              core (mdb.c, midl.c, module.c), the reference tool this
+#              package's interoperability gate builds (mdb_dump.c), the two
+#              headers those units include by name (lmdb.h, midl.h), the
+#              other three upstream tools (mdb_stat, mdb_copy, mdb_load,
+#              mdb_drop), upstream's own test programs and sample databases
+#              (mtest.c..mtest6.c, mtest_enc.c, mtest_enc2..4.c,
+#              mtest_remap.c, mplay.c, chacha8.c/h, crypto.c, cryptoc.c,
+#              sample-mdb.txt, sample-bdb.txt), the five man pages, the
+#              licence and copyright files, and the Makefile, Doxyfile,
+#              CHANGES, intro.doc, upgrading.doc, tooltag and upstream's own
+#              libraries/liblmdb/.gitignore. It is a complete copy of that one
+#              directory, not a copy of the upstream repository: upstream also
+#              ships contrib/, the OpenLDAP tree it lives in, its own CI and
+#              its documentation site, none of which is here.
+#
+#    1 file    testdata/corpus.txt, the known-answer corpus. Not upstream's
+#              and not compiled: `tests.zig` embeds it with @embedFile and
+#              `testdata/interop.zig` writes it through the facade and
+#              compares upstream's `mdb_dump -p` output against it. It is
+#              hashed here because a silent edit to it moves every published
+#              expectation in the package at once.
+#
+# The package ships the complete libraries/liblmdb directory, not only the
+# translation units compiled into the archive. All 42 upstream records and
+# the independent corpus below survive materialization from `.paths`.
+# Run `sha256sum -c UPSTREAM.sha256` from either repository or package root;
+# every listed file must exist and match. Missing files are not expected.
+#
+# Deliberately absent, each for a stated reason:
+#   build.zig, build.zig.zon, translate.h, zig/, tests.zig, smoke.zig,
+#   cross-test.profile.sh, testdata/interop.zig, consumer/,
+#   .github/workflows/verify.yml, .gitignore and this fork's six documents --
+#   this fork's own files, listed in NOTICE.md. The package-root `.gitignore`
+#   is a fork file that keeps upstream's rules and appends Zig entries;
+#   `libraries/liblmdb/.gitignore` is upstream's and IS hashed above.
+#   .zig-cache/ and zig-out/ -- build output, ignored by the fork's
+#   `.gitignore` and absent from `.paths`.
+#   UPSTREAM.sha256 itself -- a record cannot contain its own digest.
+#
+# These are the bytes in this working tree, hashed as a raw byte read (Bun
+# `Bun.file(path).arrayBuffer()`, SHA-256 from `node:crypto`) on 2026-10-01.
+# No shell hashing command and no git command produced any line of this file.
+# They are not a signature and not a Git object id: see UPSTREAM.md,
+# "Integrity", for what they do and do not establish, and for how the
+# whole-tree archive receipt is a different record from this per-file one.
+#
+# Verify with:  sha256sum -c UPSTREAM.sha256
+86cd21d2ba940c84a83ecac88985c316a37e363aa7c8d83fd24ae1439f32116e  libraries/liblmdb/upgrading.doc
+712f75101610eed2b7dd06855d9d4bcdd1a077561b4763e234f0c601b6995720  libraries/liblmdb/tooltag
+87aa6e1645087f774fab8518f62ad27bfac5be1675406f1c2073cf8b064f75d7  libraries/liblmdb/sample-mdb.txt
+8c23a9d1ef0edf23faf9955379edf8bb0d46aa8b71fc019ad47ebf8d7ecfa404  libraries/liblmdb/sample-bdb.txt
+57fdb1c13250543ad3e43e91075ee4eee505fa4f77e5db47a81805ecdca4571c  libraries/liblmdb/mtest_enc4.c
+de3bb75dc1ce1ed613dcfb3b2bd27a3a2c73dfad476f206514df3970061c0f04  libraries/liblmdb/mtest_remap.c
+679f1a6a02d2d3a5472ec43b356c442328cc615a81165dc9a8aab06a52fc737c  libraries/liblmdb/mtest_enc3.c
+7b91f012a12009a3a142fda7d16e87a9917f1cad448912344cc3fbb56daf7097  libraries/liblmdb/mtest_enc2.c
+989bf9ef6550140e614aec0be6aa994c970a71bcaa82f5938c20c06ab9b58020  libraries/liblmdb/mtest_enc.c
+73ad4b08c53c30e9fc2daac32811aee6fe3977bac51edc8e67b6cb7978bfbdd0  libraries/liblmdb/mtest6.c
+7ceab228195079f20b58d6044241270192a2f0d60725b414b40e0eaec6304e24  libraries/liblmdb/mtest5.c
+cc93eaed350b5bf05fdb115eddfd3c5ba9120c08cf9e5ec84475ff07e68d59c8  libraries/liblmdb/mtest4.c
+cf086f26f04bcb322064cf1d685c08dbf3dfc9d46238f08d9c61af22a19e683b  libraries/liblmdb/mtest3.c
+50b6fcdb58f9c94e84a4faaffb542aa67b93c82ae47a8b172a054d150b9ec093  libraries/liblmdb/mtest2.c
+8fb34c325b53bd87563a40e7410a997ee9c7fe7c069f3dfa7e82b506f41c2f05  libraries/liblmdb/mtest.c
+49cef35e9f0b179f043e4e6aabde24dc6d9b3574b28238b34dd75bdcc8bcfc18  libraries/liblmdb/mplay.c
+94a6916de09dc33b0fb6d419bfcf8c25335f7296794aa00a5088173368891dec  libraries/liblmdb/module.c
+ff8babe69bb4a90aca5798789264c53de4f9efaee2f8cea3ab617c05d7e842d8  libraries/liblmdb/midl.h
+26a37f2e94e147e7cce4c8875c94d239d528d1b7b6ac6dfa5d73673dd7fd29f6  libraries/liblmdb/midl.c
+e70f10aafc2e2141a3687bba050bc03c3d20594946ca3accfd36ffa2e6a195cb  libraries/liblmdb/mdb_stat.c
+f59b06f24c716e85c949cd03fb55581025e04557c961311c1c1c40ee907b07e0  libraries/liblmdb/mdb_stat.1
+592769f06b8c49f34310315ba24c6757652f63fb3169d14d09e53b77205a191e  libraries/liblmdb/mdb_load.c
+4c93f5099923b27b1ca0d5948e7ef40d0a5573e44261ec61060f27149f9d677b  libraries/liblmdb/mdb_load.1
+22f64827fab324da74bf466d47e68a684fe3f0b30845334cf7fa63d636ad2164  libraries/liblmdb/mdb_dump.c
+e41184594576cc0a0045cff666e7502cc0be5984885519181acfd5b40808125f  libraries/liblmdb/mdb_dump.1
+558479ad5ff5ba71f4f559c0c733f7ddb1ac85a26e3590e2dbb6ba7647e840b3  libraries/liblmdb/mdb_drop.c
+bf990385292c9f992eeec4a8f36cfcfab22e3f19e40cfe8074fa54063bae9f9e  libraries/liblmdb/mdb_drop.1
+48ce97dbfbbac45db58b67f45f9cc49282916b5ddb95aa10e2a083280cbb931e  libraries/liblmdb/mdb_copy.c
+c507a771d7a6466e5efe85338a04ef6b2778ca346e80bfce0ba1d17e557017d9  libraries/liblmdb/mdb_copy.1
+ea7ff59d8054f0c11464abcb14f8ff106d1dea87d6891a80ccff8f319d6fde4c  libraries/liblmdb/mdb.c
+6c5a92b0ad225ce1ff47eb68eab467e788a237d82557f9961686917fee1dfc56  libraries/liblmdb/lmdb.h
+f716431fc2d079320bb2881fc34150adb58193fbff5e7a2fdad07275945bfbd5  libraries/liblmdb/intro.doc
+5de0f0b272a4c0ed7d2c0ed4d39cb066b95e2f783550abccb209cb6779cc2f85  libraries/liblmdb/cryptoc.c
+3fbc9f6ee1dcc56c717c45bac5835f13294737b08338c03a2469e5df707a9dda  libraries/liblmdb/crypto.c
+f4eda7c4cbacf71fe921eb2276f3909be0e4c5048a822e7728f73b82b725bd9c  libraries/liblmdb/chacha8.h
+c214634ba9910b4a8a52f8fdf1b3fffaccff96926a7ff7c61a91d9b4dead9e37  libraries/liblmdb/chacha8.c
+bce23541b63ebc0010fd524bc5f034d99a5b62bbf498302b5020ada626461bb4  libraries/liblmdb/Makefile
+310fe25c858a9515fc8c8d7d1f24a67c9496f84a91e0a0e41ea9975b1371e569  libraries/liblmdb/LICENSE
+f4e7d29adef52ef8df195595eb5f33f963a7d3417b2e410b7b75ea4710df1af1  libraries/liblmdb/Doxyfile
+3c87f63656b6a12fda225b6f798c547fe89e3404f499e890b445761eb310fd4f  libraries/liblmdb/COPYRIGHT
+edb8b86ea258f2e8f83ef0e455f6efc0ae1760a5ec510d91d81f90072db4384f  libraries/liblmdb/CHANGES
+00325ae615fca0c92c5b4ba00e66099f40919dc422ce84eb86098bcc5193e927  libraries/liblmdb/.gitignore
+e42925ad8e2b0a29abe15b6a12ab8040f6e578450fdea4ddd2df7838edb05908  testdata/corpus.txt

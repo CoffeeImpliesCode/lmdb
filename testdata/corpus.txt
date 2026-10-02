@@ -1,0 +1,37 @@
+# LMDB facade fixture corpus.
+#
+# One record per line: key, a single TAB, value. A '#' starts a comment and
+# blank lines are ignored. Every byte is printable ASCII other than the TAB
+# separator, and no byte is a backslash, so this file can be compared directly
+# against the body of an `mdb_dump -p` of the environment it produced.
+#
+# The two blocks below are deliberate and different:
+#
+#   [insert] is the order the writer stores the records in.
+#   [expect] is the order a forward cursor must hand them back in, written
+#            down here rather than computed, so the test compares the C's
+#            collation against an answer recorded by hand.
+#
+# The default collation is memcmp over the common prefix with the shorter item
+# first (mdb.c:6659-6675), so the expected order is `Zulu` (0x5A) before the
+# lowercase keys, `alpha` before `alphabet` because it is a prefix of it, and
+# `delta` before `gamma`.
+#
+# `delta` has an empty value, which is what makes the reader's zero-length
+# case observable: a key must be at least one byte, a value need not be.
+
+[insert]
+gamma	third
+alpha	first
+Zulu	fourth
+alphabet	sixth
+beta	second
+delta	
+
+[expect]
+Zulu	fourth
+alpha	first
+alphabet	sixth
+beta	second
+delta	
+gamma	third
