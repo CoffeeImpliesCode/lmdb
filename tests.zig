@@ -28,6 +28,18 @@
 //! `mdb_env_set_maxdbs` a precondition of the call. The limit belongs to the
 //! handle, not to the file, so every environment that will open a name has
 //! to ask for it — including a reopen of one that is already there.
+//!
+//! ## The one configuration difference
+//!
+//! In a runtime-loading build (`-Druntime=true`) the module reaches liblmdb
+//! through a table that `lmdb.load` fills, so nothing in this file works until
+//! a provider is named: `--provider` is not available to a test binary, so it
+//! is the `LMDB_TEST_PROVIDER` environment variable, pointing at a shared
+//! object that exports the `mdb_*` entry points of
+//! `libraries/liblmdb/lmdb.h`. The load happens once, inside
+//! [`Sandbox.init`], because that is what every test calls first; a variable
+//! that is unset stops the suite there, by name, instead of letting it report
+//! success for nothing. A linked build reads neither and needs no provider.
 
 const std = @import("std");
 const lmdb = @import("lmdb");
@@ -35,6 +47,68 @@ const builtin = @import("builtin");
 
 const io = std.testing.io;
 const gpa = std.testing.allocator;
+
+/// A shared object exporting the `mdb_*` entry points of
+/// `libraries/liblmdb/lmdb.h`, named by the environment in a runtime-loading
+/// build.
+const provider_variable = "LMDB_TEST_PROVIDER";
+
+/// Make the native library usable, once, before any test calls the facade.
+///
+/// In a linked build the facade is usable already and this is a no-op at
+/// comptime. In a runtime-loading build every call into the module goes
+/// through a table that `load` fills, so this is where the one explicit load
+/// happens. It is safe to call from every test: the contract makes the same
+/// request idempotent, and the loader keeps the handle to the end of the
+/// process.
+///
+/// A build that was not told which file to load stops here with the variable's
+/// name, rather than reporting a test failure that says nothing about the
+/// reason. A suite that quietly stopped testing because a variable was unset
+/// would report success for nothing, and one that failed anonymously would send
+/// the next person looking in the loader instead of at the command line.
+fn nativeReady() void {
+    if (comptime !lmdb.runtime_loaded) return;
+    if (lmdb.loadedSource() != null) return;
+
+    var buffer: [4096]u8 = undefined;
+    const value = std.testing.environ.getAlloc(gpa, provider_variable) catch
+        missingProvider();
+    defer gpa.free(value);
+    if (value.len == 0 or value.len > buffer.len) missingProvider();
+    @memcpy(buffer[0..value.len], value);
+    lmdb.load(.{ .path = buffer[0..value.len] }) catch |err| {
+        std.debug.print(
+            "tests.zig: loading " ++ provider_variable ++ " = \"{s}\" failed: {t}\n",
+            .{ buffer[0..value.len], err },
+        );
+        @panic("tests.zig: the provider named by " ++ provider_variable ++
+            " did not load; nothing below this line ran");
+    };
+}
+
+fn missingProvider() noreturn {
+    @panic(
+        "tests.zig: this is a runtime-loading build and " ++ provider_variable ++
+            " is not set. Point it at a shared object exporting the mdb_* " ++
+            "entry points of libraries/liblmdb/lmdb.h, for example the one " ++
+            "`zig build -Dlinkage=dynamic` installs, and export it for the " ++
+            "whole `zig build` invocation: the build cannot inject a path " ++
+            "into a run step's environment.",
+    );
+}
+
+/// The bytes an `MDB_val` describes, borrowed.
+///
+/// The same rule the facade follows (`zig/root.zig`, `borrowed`): nothing is
+/// copied and nothing is retained past the call. It exists here because the
+/// comparator below is handed `MDB_val`s by the C and has to read them without
+/// the facade's own private helper.
+fn valBytes(val: lmdb.c.MDB_val) []const u8 {
+    if (val.mv_size == 0) return "";
+    const bytes: [*]const u8 = @ptrCast(val.mv_data.?);
+    return bytes[0..val.mv_size];
+}
 
 /// The environment variables that name a temporary root, in the order they are
 /// consulted: `TMPDIR` on every platform, the Windows spellings after it.
@@ -85,7 +159,19 @@ const Sandbox = struct {
     const random_bytes_count = 12;
     const sub_path_len = std.base64.url_safe.Encoder.calcSize(random_bytes_count);
 
+    /// Create the sandbox and, in a runtime-loading build, load the provider.
+    ///
+    /// Every test here opens its environment through this call, so this is
+    /// where the one explicit `load` happens. In a runtime-loading build the
+    /// module reaches the library through a table, and nothing below would
+    /// work — or would fail in a way that names the loader rather than the
+    /// command line — until that table is filled. In a linked build
+    /// `nativeReady` is a no-op at comptime and costs nothing.
+    ///
+    /// The root is made when it is not there yet. Only the random child made
+    /// below it belongs to this test, and only that one is removed.
     fn init() !Sandbox {
+        nativeReady();
         var random_bytes: [random_bytes_count]u8 = undefined;
         io.random(&random_bytes);
         var sub_path: [sub_path_len]u8 = undefined;
@@ -94,8 +180,6 @@ const Sandbox = struct {
         const root = try scratchRootAlloc(std.testing.environ);
         defer gpa.free(root);
 
-        // The root is made when it is not there yet. Only the random child
-        // made below it belongs to this test, and only that one is removed.
         const parent = try std.Io.Dir.cwd().createDirPathOpen(io, root, .{});
         errdefer parent.close(io);
         try parent.createDirPath(io, &sub_path);
@@ -703,7 +787,7 @@ test "reset and renew are refused on the wrong kind of transaction" {
     try std.testing.expectError(error.TransactionNotReset, reader.renew());
 }
 
-test "a read cursor is closed by the caller after its transaction has ended" {
+test "a read cursor closes before teardown and stays closed after its parent ends" {
     var box = try Sandbox.init();
     defer box.deinit();
 
@@ -718,20 +802,19 @@ test "a read cursor is closed by the caller after its transaction has ended" {
         try seed.commit();
     }
 
-    var cursor: lmdb.Cursor = undefined;
-    {
-        var txn = try env.beginReadOnly();
-        defer txn.abort();
-        const db = try txn.openDatabase(null, .{});
-        cursor = try txn.openCursor(db);
-        try std.testing.expectEqualStrings("alpha", (try cursor.first()).key);
-        // The transaction is aborted here, and a read-only transaction never
-        // frees its cursors: lmdb.h:1622-1624 leaves that to the caller.
-    }
+    var txn = try env.beginReadOnly();
+    defer txn.abort();
+    const db = try txn.openDatabase(null, .{});
+    var cursor = try txn.openCursor(db);
+    defer cursor.close();
+    try std.testing.expectEqualStrings("alpha", (try cursor.first()).key);
 
-    // Closing after the transaction ended is the documented order, and the
-    // cursor must not have been freed underneath us.
+    // MDB_RPAGE_CACHE cleanup reads the live transaction. The caller closes
+    // the read cursor before ending the snapshot, not after it.
     cursor.close();
+    try std.testing.expectError(error.CursorClosed, cursor.first());
+    txn.abort();
+    try std.testing.expectError(error.CursorClosed, cursor.first());
     cursor.close();
 }
 
@@ -1029,4 +1112,554 @@ test "reverse keys sort from the end of the string" {
     entry = try cursor.next();
     try std.testing.expectEqualStrings("abd", entry.key);
     try std.testing.expectError(error.NotFound, cursor.next());
+}
+
+// ------------------------------------------- two-phase commit and rollback
+
+test "a prepared transaction answers only commit and abort until one of them runs" {
+    var box = try Sandbox.init();
+    defer box.deinit();
+
+    var env = try lmdb.Environment.init(.{ .path = box.path });
+    defer env.close();
+
+    var txn = try env.beginWrite();
+    defer txn.abort();
+    const db = try txn.openDatabase(null, .{});
+    try txn.put(db, "alpha", "prepared");
+
+    try txn.prepare();
+
+    // The data pages are on disk and the metapage is not (mdb.c:4601-4613), so
+    // the C considers the transaction half-finished and nothing else may touch
+    // it. Every one of these is the facade refusing, not the C answering.
+    try std.testing.expectError(error.TxnPending, txn.get(db, "alpha"));
+    try std.testing.expectError(error.TxnPending, txn.put(db, "beta", "second"));
+    try std.testing.expectError(error.TxnPending, txn.delete(db, "alpha"));
+    try std.testing.expectError(error.TxnPending, txn.openDatabase(null, .{}));
+    try std.testing.expectError(error.TxnPending, txn.openCursor(db));
+    try std.testing.expectError(error.TxnPending, txn.beginNested());
+    try std.testing.expectError(error.TxnPending, txn.prepare());
+
+    try txn.commit();
+
+    var reader = try env.beginReadOnly();
+    defer reader.abort();
+    const read_db = try reader.openDatabase(null, .{});
+    try std.testing.expectEqualStrings("prepared", try reader.get(read_db, "alpha"));
+}
+
+test "a prepared transaction that is abandoned leaves no record a later reader can find" {
+    var box = try Sandbox.init();
+    defer box.deinit();
+
+    {
+        var env = try lmdb.Environment.init(.{ .path = box.path });
+        defer env.close();
+
+        var keep = try env.beginWrite();
+        const keep_db = try keep.openDatabase(null, .{});
+        try keep.put(keep_db, "kept", "committed");
+        try keep.commit();
+
+        var lost = try env.beginWrite();
+        const lost_db = try lost.openDatabase(null, .{});
+        try lost.put(lost_db, "lost", "written but never committed");
+        // The pages really are written before this point, which is what makes
+        // abandoning the transaction the interesting case rather than a write
+        // that never happened.
+        try lost.prepare();
+        lost.abort();
+    }
+
+    var env = try lmdb.Environment.init(.{ .path = box.path });
+    defer env.close();
+    var reader = try env.beginReadOnly();
+    defer reader.abort();
+    const db = try reader.openDatabase(null, .{});
+    try std.testing.expectEqualStrings("committed", try reader.get(db, "kept"));
+    try std.testing.expectError(error.NotFound, reader.get(db, "lost"));
+}
+
+test "the newest commit can be rolled back and an older or unknown one cannot" {
+    var box = try Sandbox.init();
+    defer box.deinit();
+
+    var env = try lmdb.Environment.init(.{ .path = box.path });
+    defer env.close();
+
+    var first_id: lmdb.Size = 0;
+    var second_id: lmdb.Size = 0;
+    {
+        var first = try env.beginWrite();
+        const db = try first.openDatabase(null, .{});
+        try first.put(db, "alpha", "first");
+        first_id = try first.id();
+        try first.commit();
+    }
+    {
+        var second = try env.beginWrite();
+        const db = try second.openDatabase(null, .{});
+        try second.put(db, "beta", "second");
+        second_id = try second.id();
+        try second.commit();
+    }
+
+    // Two independent entry points have to agree: `mdb_txn_id` names the
+    // transaction that is about to be written, and `MDB_envinfo.me_last_txnid`
+    // names the metapage that now holds it (mdb.c:3377, :4937).
+    try std.testing.expect(second_id > first_id);
+    const newest = try env.info();
+    try std.testing.expectEqual(second_id, newest.last_txn);
+
+    // Rollback names the newest commit and nothing else (mdb.c:4662-4665).
+    try std.testing.expectError(error.CantRollback, env.rollback(newest.last_txn + 1));
+    try std.testing.expectError(error.CantRollback, env.rollback(0));
+
+    try env.rollback(newest.last_txn);
+
+    // A fresh handle, so the answer comes from the file rather than from an
+    // environment that was holding the rolled-back metapage in memory.
+    var reopened = try lmdb.Environment.init(.{ .path = box.path });
+    defer reopened.close();
+    var reader = try reopened.beginReadOnly();
+    defer reader.abort();
+    const db = try reader.openDatabase(null, .{});
+    try std.testing.expectEqualStrings("first", try reader.get(db, "alpha"));
+    try std.testing.expectError(error.NotFound, reader.get(db, "beta"));
+}
+
+// ----------------------------------------------------- callbacks and ordering
+
+/// Compare two keys from their last byte backwards, the way `MDB_REVERSEKEY`
+/// collates them and the way this test's walk expects to see them.
+///
+/// A Zig function handed to the C: `callconv(.c)` because that is the calling
+/// convention `MDB_cmp_func` declares, and the two `MDB_val *` parameters
+/// because that is what the C passes. Both items belong to the map and neither
+/// is retained past the call.
+fn compareKeysFromTheEnd(
+    a: [*c]const lmdb.c.MDB_val,
+    b: [*c]const lmdb.c.MDB_val,
+) callconv(.c) c_int {
+    const left = valBytes(a.*);
+    const right = valBytes(b.*);
+    const shared = @min(left.len, right.len);
+    var index: usize = shared;
+    while (index > 0) {
+        index -= 1;
+        if (left[index] != right[index]) {
+            return if (left[index] < right[index]) @as(c_int, -1) else 1;
+        }
+    }
+    if (left.len == right.len) return 0;
+    return if (left.len < right.len) @as(c_int, -1) else 1;
+}
+
+test "a caller-supplied key comparator decides the order the walk produces" {
+    var box = try Sandbox.init();
+    defer box.deinit();
+
+    var env = try lmdb.Environment.init(.{ .path = box.path });
+    defer env.close();
+
+    var txn = try env.beginWrite();
+    defer txn.abort();
+    const db = try txn.openDatabase(null, .{});
+
+    // Upstream records the function and nothing more (mdb.c:12642-12649), so
+    // the order below can only come from the C calling it.
+    try txn.setKeyComparator(db, compareKeysFromTheEnd);
+    for ([_][]const u8{ "abc", "abd", "xbc" }) |key| try txn.put(db, key, key);
+
+    var cursor = try txn.openCursor(db);
+    defer cursor.close();
+
+    // From the last byte: 'c' before 'd', so "xbc" precedes "abd"; "abc" and
+    // "xbc" tie on the last byte and are separated by 'a' against 'x'. The
+    // forward collation would have put "abd" second, so this order cannot
+    // arrive by accident.
+    try std.testing.expectEqualStrings("abc", (try cursor.first()).key);
+    try std.testing.expectEqualStrings("xbc", (try cursor.next()).key);
+    try std.testing.expectEqualStrings("abd", (try cursor.next()).key);
+    try std.testing.expectError(error.NotFound, cursor.next());
+
+    // The same ordering, asked of the database directly: the comparator is the
+    // one installed above, not a private copy of the forward rule.
+    try std.testing.expect((try txn.compareKeys(db, "abc", "abd")) < 0);
+    try std.testing.expect((try txn.compareKeys(db, "abd", "xbc")) > 0);
+    try std.testing.expectEqual(@as(c_int, 0), try txn.compareKeys(db, "abc", "abc"));
+}
+
+test "a database without duplicates still answers the duplicate comparison" {
+    var box = try Sandbox.init();
+    defer box.deinit();
+
+    // Named databases, not the main one: the comparison needs one handle with
+    // `dupsort` and one without, and the main database cannot be either of
+    // them — `mdb_dbi_open` refuses to open a name beside a main database
+    // carrying `dupsort` (mdb.c:12321-12322), which is exactly the state
+    // opening "duplicates" on the main handle would have left behind.
+    //
+    // Two of them, so the handle table has room for both named slots on top of
+    // the two upstream keeps for itself (`CORE_DBS`, mdb.c:1352, added by
+    // `mdb_env_set_maxdbs`, mdb.c:5220).
+    var env = try lmdb.Environment.init(.{ .path = box.path, .max_dbs = 2 });
+    defer env.close();
+
+    var txn = try env.beginWrite();
+    defer txn.abort();
+    const duplicates = try txn.openDatabase("duplicates", .{ .create = true, .dupsort = true });
+    const plain = try txn.openDatabase("plain", .{ .create = true });
+
+    // A database opened *without* `dupsort` has no duplicate comparator to
+    // answer with at all: `mdb_default_cmp` stores a null `md_dcmp` for it
+    // (mdb.c:12258-12259) and `mdb_dcmp` calls that pointer with no check
+    // (mdb.c:2222-2225). That is what lmdb.h:1821 states as the precondition —
+    // "The database must have the `MDB_DUPSORT` flag" — and the state has no
+    // observation short of making the call, so it is stated here rather than
+    // exercised.
+    //
+    // `mdb_set_dupsort` is how a comparator is obtained at all. Upstream
+    // records it whatever the flags were: the call tests only that the handle
+    // exists (mdb.c:12651-12658), so there is no `MDB_INCOMPATIBLE`. The
+    // database that has no duplicates is therefore given an ordering, and from
+    // that moment `mdb_dcmp` calls exactly that function (mdb.c:2222-2225).
+    // It is installed before any record, which is where lmdb.h:1462-1464
+    // requires a comparator to go.
+    try txn.setValueComparator(plain, compareKeysFromTheEnd);
+    try std.testing.expect((try txn.compareValues(plain, "alpha", "beta")) > 0);
+    // "a" is a prefix of "alpha", so the shorter item still collates first.
+    try std.testing.expect((try txn.compareValues(plain, "a", "alpha")) < 0);
+
+    // On a `dupsort` handle the default is `mdb_cmp_memn`
+    // (mdb.c:12258-12262): byte-lexicographic with the shorter item first
+    // (mdb.c:6659-6675). Asking the two handles side by side is what makes this
+    // a fact about the database rather than about the facade: one call, two
+    // answers, two different `md_dcmp` values behind them.
+    try std.testing.expect((try txn.compareValues(duplicates, "alpha", "beta")) < 0);
+    try std.testing.expect((try txn.compareValues(duplicates, "beta", "alpha")) > 0);
+    try std.testing.expectEqual(@as(c_int, 0), try txn.compareValues(duplicates, "alpha", "alpha"));
+    try std.testing.expect((try txn.compareValues(duplicates, "a", "alpha")) < 0);
+
+    // And a `dupsort` handle answers with a replacement too, so what the
+    // comparison reaches is the database's own function and not the default it
+    // was opened with. Installed before any record, as above.
+    try txn.setValueComparator(duplicates, compareKeysFromTheEnd);
+    try std.testing.expect((try txn.compareValues(duplicates, "alpha", "beta")) > 0);
+    try std.testing.expect((try txn.compareValues(duplicates, "a", "alpha")) < 0);
+}
+
+// ------------------------------------------- catalogue records and raw route
+
+test "a walk of the main database tells catalogue records from user records" {
+    var box = try Sandbox.init();
+    defer box.deinit();
+
+    // `max_dbs` is a precondition of the named open below; see the module
+    // comment and lmdb.h:1326-1327.
+    var env = try lmdb.Environment.init(.{ .path = box.path, .max_dbs = 1 });
+    defer env.close();
+
+    var txn = try env.beginWrite();
+    defer txn.abort();
+    const main = try txn.openDatabase(null, .{});
+    try txn.put(main, "alpha", "first");
+    _ = try txn.openDatabase("sorted", .{ .create = true });
+
+    var unpositioned = try txn.openCursor(main);
+    // Upstream answers 0 rather than refusing when there is no record to be on
+    // (mdb.c:9816-9826), so this is an answer and not an error.
+    try std.testing.expect(!try unpositioned.onNamedDatabase());
+    unpositioned.close();
+
+    var cursor = try txn.openCursor(main);
+    defer cursor.close();
+
+    try std.testing.expectEqualStrings("alpha", (try cursor.first()).key);
+    try std.testing.expect(!try cursor.onNamedDatabase());
+    try std.testing.expectEqual(main.dbi, try cursor.database());
+    try std.testing.expectEqual(txn.handle.?, try cursor.transaction());
+
+    // The catalogue entry for "sorted" is a sub-data record, and its key is the
+    // name with the terminator the C measured with it (lmdb.h:1329).
+    const catalogue = try cursor.next();
+    try std.testing.expectEqualStrings("sorted\x00", catalogue.key);
+    try std.testing.expect(try cursor.onNamedDatabase());
+    try std.testing.expectError(error.NotFound, cursor.next());
+
+    // Having run off the end, the cursor is *not* back where it started, and it
+    // does not answer "no record" the way the never-positioned one did. Running
+    // past the last record sets `C_EOF` and returns `MDB_NOTFOUND` while
+    // leaving `C_INITIALIZED` and the record index alone (mdb.c:7912-7917), and
+    // `mdb_cursor_is_db` asks about `C_INITIALIZED`, never about `C_EOF`
+    // (mdb.c:9816-9826). The cursor is still on the record it last reached —
+    // `MDB_GET_CURRENT` reads that same record back (mdb.c:8340-8366) — so a
+    // walk that asks "am I past the end?" through this is never told. The
+    // `MDB_NOTFOUND` above is the whole of the end-of-walk signal.
+    try std.testing.expect(try cursor.onNamedDatabase());
+    try std.testing.expectEqualStrings("sorted\x00", (try cursor.current()).key);
+}
+
+test "the raw page-at-a-time cursor operation hands back a whole leaf of duplicates" {
+    var box = try Sandbox.init();
+    defer box.deinit();
+
+    // `max_dbs` is a precondition of the named open below.
+    var env = try lmdb.Environment.init(.{ .path = box.path, .max_dbs = 1 });
+    defer env.close();
+
+    var txn = try env.beginWrite();
+    defer txn.abort();
+    const fixed = try txn.openDatabase("fixed", .{
+        .dupsort = true,
+        .dupfixed = true,
+        .create = true,
+    });
+    for ([_][]const u8{ "aaaa", "bbbb", "cccc" }) |value| try txn.put(fixed, "key", value);
+
+    var cursor = try txn.openCursor(fixed);
+    defer cursor.close();
+    _ = try cursor.set("key");
+    // FIRST_DUP is what initialises the duplicate sub-cursor, which
+    // `MDB_GET_MULTIPLE` then reads (mdb.c:8399-8402).
+    _ = try cursor.firstDup();
+
+    // The result is the leaf page's metadata for the sub-tree, `NUMKEYS *
+    // md_pad` bytes (mdb.c:8416-8421): three four-byte items, in collation
+    // order. That is a count dressed as a length, which is why the typed
+    // facade leaves this operation to `c` rather than pretending otherwise.
+    var key: lmdb.c.MDB_val = .{ .mv_size = 0, .mv_data = undefined };
+    var data: lmdb.c.MDB_val = .{ .mv_size = 0, .mv_data = undefined };
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        lmdb.c.mdb_cursor_get(
+            cursor.handle.?,
+            &key,
+            &data,
+            @intCast(lmdb.c.MDB_GET_MULTIPLE),
+        ),
+    );
+    try std.testing.expectEqual(@as(lmdb.Size, 12), data.mv_size);
+    const page: [*]const u8 = @ptrCast(data.mv_data.?);
+    try std.testing.expectEqualStrings("aaaabbbbcccc", page[0..12]);
+
+    // Without `MDB_DUPFIXED` the same call is refused by the C with
+    // `MDB_INCOMPATIBLE` (mdb.c:8394-8397), and the raw route hands that status
+    // back unchanged rather than folding it into an error set.
+    const plain = try txn.openDatabase(null, .{});
+    try txn.put(plain, "alpha", "first");
+    var plain_cursor = try txn.openCursor(plain);
+    defer plain_cursor.close();
+    _ = try plain_cursor.first();
+    try std.testing.expectEqual(
+        lmdb.c.MDB_INCOMPATIBLE,
+        lmdb.c.mdb_cursor_get(
+            plain_cursor.handle.?,
+            &key,
+            &data,
+            @intCast(lmdb.c.MDB_GET_MULTIPLE),
+        ),
+    );
+}
+
+// ------------------------------------------------------ boundaries and copying
+
+test "the key size limit is exactly the boundary upstream draws" {
+    var box = try Sandbox.init();
+    defer box.deinit();
+
+    var env = try lmdb.Environment.init(.{ .path = box.path });
+    defer env.close();
+
+    // Read from the handle rather than from the header, so the number the
+    // boundary is drawn against is the one this environment will enforce.
+    const limit = try env.maxKeySize();
+
+    var txn = try env.beginWrite();
+    defer txn.abort();
+    const db = try txn.openDatabase(null, .{});
+
+    const at_limit = try gpa.alloc(u8, @intCast(limit));
+    defer gpa.free(at_limit);
+    @memset(at_limit, 'k');
+    const past_it = try gpa.alloc(u8, @as(usize, limit) + 1);
+    defer gpa.free(past_it);
+    @memset(past_it, 'k');
+
+    // lmdb.h:288-292 puts a key at 1..`mdb_env_get_maxkeysize()` and mdb.c:8605
+    // is where one past that is turned away — the boundary is `size - 1 >=
+    // limit`, so exactly `limit` is still accepted.
+    try txn.put(db, at_limit, "at the limit");
+    try std.testing.expectEqualStrings("at the limit", try txn.get(db, at_limit));
+    try std.testing.expectError(error.BadValSize, txn.put(db, past_it, "past it"));
+    // The refused key was never stored, so the record at the limit is intact.
+    try std.testing.expectEqualStrings("at the limit", try txn.get(db, at_limit));
+}
+
+test "an environment copied to another directory opens and holds the same records" {
+    var source_box = try Sandbox.init();
+    defer source_box.deinit();
+    var target_box = try Sandbox.init();
+    defer target_box.deinit();
+
+    {
+        var env = try lmdb.Environment.init(.{ .path = source_box.path });
+        defer env.close();
+        var txn = try env.beginWrite();
+        defer txn.abort();
+        const db = try txn.openDatabase(null, .{});
+        for ([_][]const u8{ "alpha", "beta", "gamma" }) |key| try txn.put(db, key, key);
+        try txn.commit();
+    }
+
+    {
+        var env = try lmdb.Environment.init(.{ .path = source_box.path });
+        defer env.close();
+        // The target has to exist, be writable and otherwise be empty
+        // (lmdb.h:731-745), which is exactly what the sandbox handed over.
+        try env.copy(target_box.path);
+    }
+
+    var copy = try lmdb.Environment.init(.{ .path = target_box.path });
+    defer copy.close();
+    var reader = try copy.beginReadOnly();
+    defer reader.abort();
+    const db = try reader.openDatabase(null, .{});
+    var cursor = try reader.openCursor(db);
+    defer cursor.close();
+
+    var entry = try cursor.first();
+    try std.testing.expectEqualStrings("alpha", entry.key);
+    try std.testing.expectEqualStrings("alpha", entry.value);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("beta", entry.key);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("gamma", entry.key);
+    try std.testing.expectError(error.NotFound, cursor.next());
+}
+
+/// How many lines the reader-table listing has produced so far.
+var reader_lines: usize = 0;
+
+/// Count one reader-table line and ask for the listing to continue.
+///
+/// The message is the library's own and is not kept: `mdb_reader_list` builds
+/// each line in a stack buffer and hands it over for the duration of the call
+/// (mdb.c:12689, :12702).
+fn countReaderLine(_: [*c]const u8, _: ?*anyopaque) callconv(.c) c_int {
+    reader_lines += 1;
+    return 0;
+}
+
+test "the reader table reports the readers that are open and reclaims none of them" {
+    var box = try Sandbox.init();
+    defer box.deinit();
+
+    var env = try lmdb.Environment.init(.{ .path = box.path, .max_readers = 8 });
+    defer env.close();
+
+    {
+        var writer = try env.beginWrite();
+        defer writer.abort();
+        const db = try writer.openDatabase(null, .{});
+        try writer.put(db, "alpha", "first");
+        try writer.commit();
+    }
+
+    // With no reader open, upstream still speaks once (mdb.c:12716-12717), so
+    // this checks that the callback was reached at all and not how many lines
+    // there were.
+    reader_lines = 0;
+    try std.testing.expect(try env.listReaders(countReaderLine, null) >= 0);
+    try std.testing.expect(reader_lines >= 1);
+
+    var reader = try env.beginReadOnly();
+    defer reader.abort();
+    const db = try reader.openDatabase(null, .{});
+    try std.testing.expectEqualStrings("first", try reader.get(db, "alpha"));
+
+    // One header line and one line for this reader, both written by upstream.
+    reader_lines = 0;
+    try std.testing.expect(try env.listReaders(countReaderLine, null) >= 0);
+    try std.testing.expectEqual(@as(usize, 2), reader_lines);
+
+    // A reader whose thread is still here is not a stale slot, so nothing is
+    // reclaimed. That is the whole point of the check, and it is a different
+    // answer from "the table has room".
+    try std.testing.expectEqual(@as(c_int, 0), try env.clearStaleReaders());
+}
+
+const ReaderCallbackResult = struct {
+    result: c_int,
+    calls: usize = 0,
+
+    fn callback(_: [*c]const u8, context: ?*anyopaque) callconv(.c) c_int {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        return self.result;
+    }
+};
+
+test "a negative reader callback result aborts before the reader entry" {
+    var box = try Sandbox.init();
+    defer box.deinit();
+    var env = try lmdb.Environment.init(.{ .path = box.path });
+    defer env.close();
+    var reader = try env.beginReadOnly();
+    defer reader.abort();
+
+    // An active reader produces a header then its entry (mdb.c:12705-12713).
+    // A negative callback result at the header must stop before that entry.
+    var callback_result: ReaderCallbackResult = .{ .result = -1 };
+    try std.testing.expectEqual(@as(c_int, -1), try env.listReaders(ReaderCallbackResult.callback, &callback_result));
+    try std.testing.expectEqual(@as(usize, 1), callback_result.calls);
+}
+
+test "a positive reader callback result continues listing without becoming an errno" {
+    var box = try Sandbox.init();
+    defer box.deinit();
+    var env = try lmdb.Environment.init(.{ .path = box.path });
+    defer env.close();
+    var reader = try env.beginReadOnly();
+    defer reader.abort();
+
+    // 13 is a successful callback result, not the POSIX EACCES status.
+    // Both the header and the active reader entry must reach the callback.
+    var callback_result: ReaderCallbackResult = .{ .result = 13 };
+    try std.testing.expectEqual(@as(c_int, 13), try env.listReaders(ReaderCallbackResult.callback, &callback_result));
+    try std.testing.expectEqual(@as(usize, 2), callback_result.calls);
+}
+
+test "dropping a named database removes it from the environment's catalogue" {
+    var box = try Sandbox.init();
+    defer box.deinit();
+
+    // `max_dbs` is a precondition of the named open below.
+    var env = try lmdb.Environment.init(.{ .path = box.path, .max_dbs = 1 });
+    defer env.close();
+
+    {
+        var writer = try env.beginWrite();
+        defer writer.abort();
+        const db = try writer.openDatabase("doomed", .{ .create = true });
+        try writer.put(db, "alpha", "first");
+        try writer.commit();
+    }
+
+    {
+        var writer = try env.beginWrite();
+        defer writer.abort();
+        const db = try writer.openDatabase("doomed", .{});
+        // `delete` true removes the database itself, and upstream closes the
+        // handle as part of that (mdb.c:12617-12621).
+        try writer.drop(db, true);
+        try writer.commit();
+    }
+
+    var reader = try env.beginReadOnly();
+    defer reader.abort();
+    // The name is gone, so opening it without `MDB_CREATE` is NotFound rather
+    // than a handle onto an empty database.
+    try std.testing.expectError(error.NotFound, reader.openDatabase("doomed", .{}));
 }

@@ -8,6 +8,67 @@
 //! handles, a Zig error set standing in for upstream's single `int` status
 //! code, and slices that carry the borrowing rules the header states in prose.
 //!
+//! ## Two configurations, one API
+//!
+//! This module is built in one of two shapes, and [`runtime_loaded`] says
+//! which at comptime.
+//!
+//! *Linked* is the default. liblmdb is linked, `c` is the translated header
+//! itself, and every call below reaches the C directly. Nothing here costs a
+//! branch, a table lookup or a load check.
+//!
+//! *Runtime-loaded* is the `-Druntime=true` configuration. `c` is a dispatch
+//! generated from that same translation, so every type and constant is the
+//! translated one and no call needs a cast; what changes is how a name reaches
+//! the library. A call becomes a call through a table that [`load`] fills, and
+//! a call before that fill stops the program with a message naming the
+//! function — in every optimization mode, because reaching an unfilled table
+//! is a programming error and not a condition to recover from.
+//!
+//! In a linked build [`load`] is a panic that says so and
+//! [`loadedSource`] answers `null`; in a runtime-loaded build the module is
+//! unusable until [`load`] succeeds. Everything else in this file — the four
+//! handles, the error set, the borrowed slices, the flag words — is identical
+//! in both, and neither configuration has an API view, an owning library object
+//! or an unload.
+//!
+//! ## The external ABI family a provider has to belong to
+//!
+//! The complete record is `runtime/library.zig`, next to the table it
+//! describes; the parts that decide whether a caller may swap one liblmdb for
+//! another are these.
+//!
+//!   * The calling convention and the scalar widths. Every status is an `int`;
+//!     `MDB_dbi` is `unsigned int`; [`Size`] is `size_t` because `MDB_VL32` is
+//!     not defined (lmdb.h:197-203); [`Mode`] is `mode_t` on the targets this
+//!     package compiles and `int` under MSVC (lmdb.h:180-184).
+//!   * The complete layouts that cross the boundary: `MDB_val`
+//!     (`{ size_t; void * }`, lmdb.h:293-296) for every key and datum,
+//!     `MDB_stat` (lmdb.h:548-556), `MDB_envinfo` (lmdb.h:559-566) and
+//!     `MDB_crypto_funcs` (lmdb.h:1873-1880). `MDB_env`, `MDB_txn` and
+//!     `MDB_cursor` are opaque (lmdb.h:267, :274, :280), so their internal
+//!     layout is *not* part of the boundary — only the pointers are.
+//!   * The C enum width of `MDB_cursor_op` (lmdb.h:436-465), which is the
+//!     target ABI's choice rather than the header's, and which
+//!     [`CursorOp`] reads back out of the translation instead of guessing.
+//!   * The per-target configuration macros in the build graph —
+//!     `MDB_USE_POSIX_MUTEX` and `MDB_USE_ROBUST` on Linux,
+//!     `MDB_USE_POSIX_SEM` on macOS, nothing forced on Windows or the BSDs,
+//!     and nothing for `MDB_VL32`, `MDB_RPAGE_CACHE` or `MDB_ENCRYPT`. They
+//!     choose between lock implementations and between sets of exported entry
+//!     points; they do not change a prototype.
+//!   * The allocator. Every allocation behind the three opaque handles is the
+//!     provider's, from `calloc` in `mdb_env_create` (mdb.c:5028) to the free
+//!     in `mdb_env_close`, and this module never mixes it with Zig's. The one
+//!     place caller memory crosses into C is the other direction: a
+//!     comparator, checksum, encryption, relocation, assert or message callback
+//!     is the caller's own function and the `void *` context is whatever the
+//!     caller put there.
+//!
+//! There are no variadic entry points in this header. Every prototype in
+//! `lmdb.h` is fixed-arity, so every call through a provider uses an ordinary
+//! typed call and none needs a tuple.
+//!
 //! ## The four handles and who frees them
 //!
 //! Upstream's contract, read out of `lmdb.h` and `mdb.c` rather than assumed:
@@ -15,33 +76,32 @@
 //!   * `MDB_env` is created by `mdb_env_create` and released by
 //!     `mdb_env_close` (lmdb.h:589-600, :892-900). It is the only handle with
 //!     no parent.
-//!   * `MDB_txn` is created by `mdb_txn_begin` and released by **either**
+//!   * `MDB_txn` is created by `mdb_txn_begin` and spent by **either**
 //!     `mdb_txn_commit` or `mdb_txn_abort` (lmdb.h:1121-1163, :1190-1206,
-//!     :1257-1265). `commit` releases it whether it succeeds or fails:
-//!     `_mdb_txn_commit` leaves through `mdb_txn_end(txn, …|MDB_END_FREE)` on
-//!     success and through `_mdb_txn_abort` on every failure branch
-//!     (mdb.c:4629-4637).
+//!     :1257-1265). Commit spends it on success and failure alike. The core
+//!     may recycle a top-level write allocation; that does not keep the
+//!     caller's transaction usable (mdb.c:3758, :4629-4635).
 //!   * `MDB_dbi` is a `unsigned int` index into the environment's slot table,
-//!     not a pointer (lmdb.h:280-281). It needs no release; `mdb_dbi_close`
+//!     not a pointer (lmdb.h:276-277). It needs no release; `mdb_dbi_close`
 //!     only returns the slot (lmdb.h:1403-1419) and is deliberately awkward.
 //!   * `MDB_cursor` is created by `mdb_cursor_open` and released by
 //!     `mdb_cursor_close` (lmdb.h:1614-1644) — but a cursor belonging to a
 //!     **write** transaction is freed by the transaction itself, and may not
-//!     outlive it. A cursor belonging to a read-only transaction is never
-//!     freed by the transaction and must be closed explicitly, before or
-//!     after the transaction ends (lmdb.h:1620-1626).
+//!     outlive it. A read-only cursor must be closed explicitly **before**
+//!     its transaction commits, aborts or resets. Although lmdb.h:1622-1624
+//!     permits later closure, this bundled core reads the transaction during
+//!     cursor cleanup (mdb.c:9786). The facade requires the stricter order.
 //!
-//! These are not stylistic choices, and the facade enforces each of them:
+//! The facade checks spent-handle state; parent lifetime and cleanup order
+//! remain caller obligations:
 //!
-//!   * [`Transaction.commit`] and [`Transaction.abort`] both clear the
-//!     handle before calling the C, so a `defer txn.abort()` that runs after a
-//!     successful commit is a no-op instead of a double free. A second
-//!     `commit` or `abort` is likewise a no-op; any *other* call on a spent
-//!     transaction returns `error.TransactionClosed`.
-//!   * [`Cursor.close`] calls `mdb_cursor_close` for a read-only cursor and
-//!     does **not** call it for a write cursor, because the owning transaction
-//!     already freed that pointer and freeing it again is a double free. This
-//!     holds whichever order the caller releases them in.
+//!   * `Transaction.commit` and `Transaction.abort` clear the handle before
+//!     calling C. A deferred abort after commit is a no-op, as is a second
+//!     abort. A second commit returns `error.TransactionClosed`.
+//!   * `Cursor.close` calls `mdb_cursor_close` for a read-only cursor while
+//!     its transaction is live. For a write cursor it spends the Zig wrapper
+//!     without freeing the transaction-owned pointer. Repeated close on the
+//!     same wrapper does nothing; independent handle copies are not tracked.
 //!   * [`Database`] is a value; nothing in this module closes a database
 //!     handle behind the caller's back. [`Environment.closeDatabase`] is the
 //!     only release, and it carries upstream's restriction verbatim.
@@ -78,17 +138,184 @@
 //! `MDB_env`, `MDB_txn` or `MDB_cursor` belongs to the C and is released by
 //! the matching C call, and every path and database name is passed to the C
 //! as the sentinel-terminated slice the caller already holds.
+//!
+//! ## What the typed surface covers, and what stays behind `c`
+//!
+//! Wrapped: the whole environment lifecycle and configuration (flags, page
+//! size, map size, database and reader limits, path, descriptor, statistics,
+//! environment info, user context, copy, incremental dump and load, and
+//! rollback), the whole transaction lifecycle (begin, nested begin, identifier,
+//! flags, prepare, commit, abort, reset, renew), every database operation
+//! upstream has (open, close, flags, statistics, drop, both comparators, the
+//! relocation function and its context, and both comparison queries), every
+//! cursor operation except the page-at-a-time ones, and the four callback
+//! families — key and value comparators, the assert callback and the reader
+//! message callback. [`Encryption`] adds the page encryptor and the page
+//! checksummer where the header declares them.
+//!
+//! Left raw, on purpose:
+//!
+//!   * the `MDB_DUPFIXED` page-at-a-time cursor operations `MDB_GET_MULTIPLE`
+//!     and its relatives, which put a *count of items* in the data value
+//!     rather than bytes, so a `[]const u8` would have to lie about it (see
+//!     [`CursorOp`]);
+//!   * `mdb_modload`, `mdb_modunload` and `mdb_modsetup`, the three entry
+//!     points LMDB's own command-line tools use to load an out-of-tree crypto
+//!     module. Their payload is `MDB_crypto_funcs` — a struct of three callback
+//!     pointers and three integers (lmdb.h:1873-1880) — and wrapping it here
+//!     would mean restating that layout and each callback's signature in Zig,
+//!     where the translation already has them exactly. A caller that needs them
+//!     reads them out of `c`;
+//!   * the raw status code behind every call, through `c` directly.
+//!
+//! Neither list removes anything from the library: every one of these names is
+//! in the complete raw surface either way, and in a runtime-loading build every
+//! one of them is resolved through the same table as the wrapped ones.
+//!
+//! ## Consumer sequence
+//!
+//! Zig 0.16.0. Import `dep.module("lmdb")` from a `b.dependency` with the
+//! consumer's target and optimize mode. The facade links the bundled archive,
+//! or the matching selected system library with `-fsys=lmdb`.
+//! `dep.module("c")` is not registered; the raw route is `pub const c` on this
+//! module, which carries this facade's own linkage with it.
+//! The bundled `dep.artifact("lmdb")` is the C archive and installs `lmdb.h`;
+//! no bundled artifact is produced in system mode.
+//!
+//! In a `-Druntime=true` build the module links nothing, and nothing works
+//! until [`load`] has been given a provider: `--provider <path>` on a program's
+//! own command line, or `LMDB_TEST_PROVIDER` in the environment, resolved by
+//! whoever runs it. There is no default location, no search, no fallback to a
+//! bundled copy and no automatic retry. See [`load`] for the rest of the
+//! contract.
+//!
+//! `path` must name an existing database directory, and LMDB does not create
+//! it: there is no `mkdir` anywhere in `mdb.c`. Each `try` propagates failure
+//! while deferred cleanup runs in cursor, transaction, environment order:
+//!
+//! ```zig
+//! const std = @import("std");
+//! const lmdb = @import("lmdb");
+//!
+//! fn readFirst(path: [:0]const u8) !void {
+//!     var env = try lmdb.Environment.init(.{ .path = path });
+//!     defer env.close();
+//!     var txn = try env.beginReadOnly();
+//!     defer txn.abort();
+//!     const db = try txn.openDatabase(null, .{});
+//!     var cursor = try txn.openCursor(db);
+//!     defer cursor.close();
+//!     const entry = try cursor.first();
+//!     std.debug.print("{s}={s}\n", .{ entry.key, entry.value });
+//! }
+//! ```
+//!
+//! Environment open/sync, writer acquisition and commit may block in the native
+//! library. They have no Zig `std.Io` cancellation channel.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 /// The unmodified upstream ABI, translated from `libraries/liblmdb/lmdb.h`.
 ///
-/// Prefer the typed wrappers above it. Reach for this when you need a call
-/// this facade does not wrap — `mdb_stat`, `mdb_env_copy`, `mdb_drop`,
-/// `mdb_env_set_flags` — or when you want the raw status code rather than
-/// [`Error`].
+/// Prefer the typed wrappers below it. Reach for this when you need a raw
+/// status code rather than [`Error`], when you want a page-at-a-time
+/// `MDB_DUPFIXED` operation that this facade deliberately does not wrap
+/// ([`CursorOp`]), or when you want the C string `mdb_strerror` builds.
+///
+/// In a runtime-loading build this module is a generated dispatch rather than
+/// the translation step's own output. It publishes the same namespace — every
+/// type and constant is re-exported from the translated header, not restated —
+/// so `c.MDB_val` here and the declaration behind the table are one nominal
+/// type and nothing needs a cast. What differs is how a name reaches the
+/// library: directly in a linked build, through the table [`load`] fills in a
+/// runtime-loaded one. [`runtime_loaded`] says which, at comptime.
 pub const c = @import("c");
+
+/// The loader core, which is where a linked build's two public types come
+/// from.
+///
+/// Imported only by the linked configuration. In a runtime-loading build the
+/// dispatch carries its own copy of the same declarations, this module is
+/// never referenced, and the import is never resolved. Either way there is
+/// exactly one `LoadSource` and one `LoadError` in a build, which is what keeps
+/// them one type for a consumer that names them.
+const rt = @import("rt");
+
+/// Whether this module was configured to resolve its native symbols at run
+/// time.
+///
+/// False for the ordinary build, where liblmdb is linked and `c` is the
+/// translated header itself. True when the build generated a dispatch that
+/// resolves the same entry points through the platform loader, in which case
+/// [`load`] is the call that makes the library usable and every entry point
+/// before it stops the program.
+///
+/// A comptime constant, so a consumer can write two different code paths and
+/// have only the one it chose analyzed.
+pub const runtime_loaded: bool = if (@hasDecl(c, "rt_runtime_loaded")) c.rt_runtime_loaded else false;
+
+/// Which native library [`load`] should open.
+///
+/// `.path` is an explicit file path and `.system` is an explicit basename
+/// handed unchanged to the platform loader. There is no path-to-system
+/// fallback in either direction and no implicit source of any kind: a request
+/// that cannot be honoured is an error, not a different library.
+pub const LoadSource = if (runtime_loaded) c.LoadSource else rt.LoadSource;
+
+/// Every way [`load`] can decline.
+///
+/// Declared here, in the module a consumer imports, rather than only inside
+/// the loader: the caller names the failure it is handling.
+pub const LoadError = if (runtime_loaded) c.LoadError else rt.LoadError;
+
+/// Load the native library this module dispatches to.
+///
+/// In a runtime-loading build this is the whole contract: call it once, then
+/// use this module as if it were linked. Calling it again with the same request
+/// succeeds and changes nothing; calling it with a different request after a
+/// success is `error.ProviderMismatch`, and the library already in use stays in
+/// use. A failed attempt publishes nothing and can be retried explicitly by
+/// calling this again: there is no automatic retry, and no implicit second
+/// source.
+///
+/// It keeps the process handle and its own copy of the request to the end of
+/// the process. There is no unload and no reset, because the table is
+/// process-global state that other code may already have called through — which
+/// is also why a second liblmdb cannot replace the first one, and why no
+/// `MDB_env`, `MDB_txn` or `MDB_cursor` may be carried across a provider
+/// change: there is no provider change.
+///
+/// Safe to call from any thread. A thread that arrives while an attempt for
+/// the same request is in flight waits for that attempt and gets its result,
+/// whatever it was. A call from the thread that is running the attempt is
+/// `ReentrantLoad` rather than a deadlock.
+///
+/// In a linked build there is no provider, no table and nothing to resolve, so
+/// this stops the program with a message saying so instead of quietly
+/// succeeding. `runtime_loaded` is false there, so a consumer that supports
+/// both configurations can tell the two apart at comptime instead of meeting
+/// this at run time.
+pub fn load(source: LoadSource) LoadError!void {
+    if (comptime !runtime_loaded) {
+        std.debug.panic(
+            "lmdb: load was called on a linked build; this module is not " ++
+                "runtime-loaded, so there is no library to load. Build with " ++
+                "runtime loading configured, or do not call load.",
+            .{},
+        );
+    }
+    return c.load(source);
+}
+
+/// The request that succeeded, or null when nothing has loaded yet.
+///
+/// The answer is the loader's own retained copy and stays valid for the life of
+/// the process. Null in a linked build, which has no request.
+pub fn loadedSource() ?LoadSource {
+    if (comptime !runtime_loaded) return null;
+    return c.loadedSource();
+}
 
 /// UNIX permissions for the files LMDB creates: `mode_t` on the platforms
 /// that have it, `int` where upstream declares it that way (lmdb.h:180-185).
@@ -178,14 +405,29 @@ pub const Error = error{
     ShortWrite,
     /// `MDB_ENV_BUSY`. The environment is in use by another handle.
     EnvBusy,
-    /// `MDB_IS_READONLY`. The environment is read-only.
+    /// `MDB_IS_READONLY`. A write was refused because the transaction or the
+    /// environment is read-only, and that refusal is the whole of the code:
+    /// a write transaction in an `MDB_RDONLY` environment —
+    /// [`Environment.beginWrite`] (mdb.c:3494-3495) — [`Environment.sync`]
+    /// on such an environment (mdb.c:3114-3115), [`Transaction.put`] and its
+    /// `NOOVERWRITE` and `NODUPDATA` variants through `mdb_put`
+    /// (mdb.c:11120-11121, :8602-8603), [`Cursor.putCurrent`]
+    /// (mdb.c:8602-8603), [`Transaction.delete`] and
+    /// [`Transaction.deleteValue`] (mdb.c:10618-10619),
+    /// [`Cursor.deleteCurrent`] and [`Cursor.deleteAllDuplicates`]
+    /// (mdb.c:9120-9121), [`Transaction.openDatabase`] with
+    /// [`DbFlags.create`] (mdb.c:12339-12340), and [`Transaction.drop`]
+    /// (mdb.c:12540-12541). Not a permissions problem: see
+    /// [`error.AccessDenied`].
     IsReadOnly,
     /// `MDB_ADDR_BUSY`. The address LMDB wanted for a fixed map is taken.
     AddrBusy,
 
-    /// `EACCES`, and `EPERM` on a POSIX build. A write was attempted in a
-    /// read-only transaction or environment, or a file could not be opened
-    /// for writing.
+    /// `EACCES`, and `EPERM` on a POSIX build. A file the environment needs
+    /// could not be opened for writing — `open(2)` in `mdb_fopen`
+    /// (mdb.c:5416-5420) — so this is the permissions on the directory or
+    /// the file, and nothing else. A write refused because the transaction
+    /// or the environment is read-only is [`error.IsReadOnly`].
     AccessDenied,
     /// `EINVAL`, and `ERROR_INVALID_PARAMETER` on a Windows build. A
     /// parameter upstream rejects — including `setMaxReaders(0)`, and any
@@ -230,12 +472,10 @@ pub const Error = error{
     /// instead — so no POSIX build can report it.
     SharingViolation,
 
-    /// The core returned a positive status that neither of the two tables in
-    /// `check` names. The code is real and diagnosable through
-    /// `pub const c`; it is reported distinctly rather than folded into a
-    /// generic failure, and it is deliberately not reinterpreted, because the
-    /// two numeric spaces a Windows build of `mdb.c` returns overlap and a
-    /// guess would name the wrong condition.
+    /// An unmapped native status, or success with an unexpectedly null result
+    /// pointer. Neither case supplies its raw code through this error tag;
+    /// call `c` directly when that detail is required. Windows status spaces
+    /// overlap, so an unknown number is not guessed into another error.
     UnexpectedStatus,
 
     /// A method was called on an [`Environment`] whose handle has been
@@ -497,6 +737,22 @@ fn borrowed(val: c.MDB_val) []const u8 {
     return bytes[0..val.mv_size];
 }
 
+/// Borrow a NUL-terminated C string the library owns.
+///
+/// `lmdb.h` declares `mdb_version` and `mdb_strerror` as returning `char *`
+/// (lmdb.h:575, :587) — not `const char *` — so the C translator may give them
+/// the plain pointer form, and `std.mem.span` does not apply to it. The
+/// parameter accepts either rendering, because a sentinel-qualified pointer
+/// coerces to a plain one, so this works whichever the translation produced.
+/// The bound is a backstop rather than the rule: every string `mdb.c` builds
+/// is far shorter, and a provider that failed to terminate one would be a
+/// fault in the provider rather than something a caller can defend against.
+fn cString(ptr: [*c]u8, comptime limit: usize) []const u8 {
+    var len: usize = 0;
+    while (len < limit and ptr[len] != 0) : (len += 1) {}
+    return ptr[0..len];
+}
+
 /// The upstream library version, as `mdb_version` reports it.
 pub const Version = struct {
     major: c_int,
@@ -504,15 +760,40 @@ pub const Version = struct {
     patch: c_int,
 };
 
-/// The version of the C this binary was linked against.
+/// The version of the liblmdb this build reaches.
 ///
-/// The returned C string belongs to the library and is static; this facade
-/// does not expose it because rendering it needs a buffer the caller did not
-/// ask for.
+/// Read out of the library rather than compiled in, so in a runtime-loading
+/// build it names the provider that was loaded and in a linked build the
+/// archive that was linked. It is not a compatibility verdict: see the external
+/// ABI family at the top of this file and the complete record in
+/// `runtime/library.zig` for what actually has to match.
 pub fn version() Version {
     var v: Version = undefined;
     _ = c.mdb_version(&v.major, &v.minor, &v.patch);
     return v;
+}
+
+/// The whole version string the library builds for itself.
+///
+/// `mdb_version` returns LMDB's own static string, which the header spells
+/// `MDB_VERSTR(MDB_VERSION_MAJOR, MDB_VERSION_MINOR, MDB_VERSION_PATCH,
+/// MDB_VERSION_DATE)` (lmdb.h:251-259) — `"LMDB 1.0.1: (Aug 6, 2026)"` for
+/// this tree's release. Borrowed, never copied, and valid for the life of the
+/// process because the string is static storage inside the library.
+pub fn versionString() []const u8 {
+    return cString(c.mdb_version(null, null, null), 256);
+}
+
+/// Upstream's description of one status code, as `mdb_strerror` builds it.
+///
+/// The two families the returned text covers are the ones [`check`] separates:
+/// a negative code is one of LMDB's own constants and this is the library's
+/// text for it; a non-negative one is handed to the platform's `strerror(3)`
+/// (lmdb.h:577-585), so the wording for a Windows code and for an `errno` is
+/// the platform's rather than this library's. Borrowed and static, like
+/// [`versionString`]. `rc` is the raw value, not an [`Error`].
+pub fn strerror(rc: c_int) []const u8 {
+    return cString(c.mdb_strerror(rc), 512);
 }
 
 // -------------------------------------------------------------------- flags
@@ -674,6 +955,98 @@ pub const CursorOp = enum(c.MDB_cursor_op) {
     set_range = @intCast(c.MDB_SET_RANGE),
 };
 
+/// Page and tree statistics for one database, read out of `MDB_stat`
+/// (lmdb.h:548-556).
+///
+/// A copy of what the C reported, with the C's own field names changed to
+/// snake_case. The C struct stays reachable through [`c`] for anything this
+/// does not name; it is one of the two complete layouts that cross the
+/// boundary, and it is a boundary because the caller reads the result rather
+/// than passing its own.
+pub const Statistics = struct {
+    /// Size of a database page in bytes. Currently the same for every database
+    /// in the environment.
+    page_size: c_uint,
+    /// Height of the B-tree.
+    depth: c_uint,
+    /// Internal, non-leaf pages.
+    branch_pages: Size,
+    /// Leaf pages.
+    leaf_pages: Size,
+    /// Pages holding items too large for a leaf.
+    overflow_pages: Size,
+    /// Data items stored in the database, duplicates counted separately.
+    entries: Size,
+};
+
+/// What the environment knows about itself, read out of `MDB_envinfo`
+/// (lmdb.h:559-566).
+pub const EnvInfo = struct {
+    /// Where the memory map starts. Borrowed from the mapping: it belongs to
+    /// the environment and goes away with it, so it names an address and is
+    /// not a pointer to anything the caller may read through.
+    map_address: ?*anyopaque,
+    /// Size of the data memory map, and so the ceiling on the database.
+    map_size: Size,
+    /// ID of the last page used.
+    last_page: Size,
+    /// ID of the last committed transaction. This is the value
+    /// [`Environment.rollback`] takes.
+    last_txn: Size,
+    /// Reader lock-table slots this environment has.
+    max_readers: c_uint,
+    /// Slots currently in use.
+    num_readers: c_uint,
+};
+
+/// Options for [`Environment.copyWithOptions`] and
+/// [`Environment.copyToFileHandle`], one field per upstream flag
+/// (lmdb.h:422-429).
+pub const CopyFlags = struct {
+    /// `MDB_CP_COMPACT`. Omit free pages from the copy.
+    compact: bool = false,
+
+    /// The `unsigned int` `mdb_env_copy2` and `mdb_env_copyfd2` take.
+    pub fn bits(self: CopyFlags) c_uint {
+        return flag(c.MDB_CP_COMPACT, self.compact);
+    }
+};
+
+/// A file handle in whatever shape this target gives one: `int` on POSIX and
+/// `void *` on Windows (lmdb.h:221-225). Returned by [`Environment.fileHandle`]
+/// and accepted by the descriptor-flavoured calls; the C's own zero is the
+/// absence of a handle, so compare against `@as(c.mdb_filehandle_t, 0)`.
+pub const FileHandle = c.mdb_filehandle_t;
+
+/// Upstream's key comparator, `MDB_cmp_func` (lmdb.h:299), and the comparator
+/// for duplicate data as well (lmdb.h:1453-1474 uses the same typedef for
+/// `mdb_set_dupsort`).
+///
+/// The translated type itself rather than a Zig spelling of it, so the
+/// contract is upstream's `MDB_cmp_func` verbatim: a caller declares a
+/// function of that type and hands it over directly. `&` is not that
+/// spelling, because taking a function's address produces a pointer to it and
+/// a pointer is not the type upstream's prototype declares. What matters here
+/// is upstream's own rule, not this module's: the same comparison function
+/// must be used by *every* program that opens the database, every time, and it
+/// must be installed before any data operation (lmdb.h:1438-1441,
+/// :1461-1464).
+pub const KeyComparator = c.MDB_cmp_func;
+
+/// Upstream's relocation callback for a `MDB_FIXEDMAP` database,
+/// `MDB_rel_func` (lmdb.h:301-315). Feature currently unimplemented upstream
+/// (lmdb.h:313), so a provider records the function and never calls it.
+pub const RelocationCallback = c.MDB_rel_func;
+
+/// Upstream's assertion callback, `MDB_assert_func` (lmdb.h:1079-1085).
+/// Installed with [`Environment.setAssertCallback`].
+pub const AssertCallback = c.MDB_assert_func;
+
+/// Upstream's reader-table message callback, `MDB_msg_func` (lmdb.h:1828-1834),
+/// used by [`Environment.listReaders`]. Returning a negative number aborts the
+/// listing; zero or more continues it.
+pub const MessageCallback = c.MDB_msg_func;
+
 // -------------------------------------------------------------- environment
 
 /// Options for [`Environment.init`].
@@ -682,9 +1055,9 @@ pub const CursorOp = enum(c.MDB_cursor_op) {
 /// never calls the corresponding setter, so the value the library chose for
 /// itself survives. A non-null value is passed through unchanged.
 pub const OpenOptions = struct {
-    /// The directory the database lives in, or the data file itself when
-    /// `flags.nosubdir` is set. Passed to the C as this exact sentinel-
-    /// terminated slice; nothing is copied and nothing is allocated.
+    /// Existing database directory, or data file when `flags.nosubdir` is set.
+    /// Borrowed until `init` returns, with no interior NUL. The facade passes
+    /// its pointer unchanged; the native environment stores a copy.
     path: [:0]const u8,
     /// Flags for the open.
     flags: EnvFlags = .{},
@@ -714,10 +1087,14 @@ pub const OpenOptions = struct {
 
 /// An LMDB environment: one directory or file, one lock table, one map.
 ///
-/// The handle is not thread-safe to create or destroy; see lmdb.h:892-897.
-/// Use one `Environment` per process, or per thread when they never share a
-/// transaction.
+/// Construct with `create` or `init`; preserve all state fields. This is a
+/// single owner: copying duplicates the native handle, not ownership. Close
+/// only that owner after its transactions and cursors have finished.
+/// Keep the wrapper alive at one address while transactions borrow it.
+/// Native environment destruction must not race any use (lmdb.h:892-897).
 pub const Environment = struct {
+    /// Owned native handle, or `null` after close. Not an independent owner;
+    /// do not replace or free it behind the facade.
     handle: ?*c.MDB_env,
     /// Whether `mdb_env_open` has succeeded on this handle. Only a success
     /// makes the handle usable; see `open_attempted` for why that is not the
@@ -765,8 +1142,8 @@ pub const Environment = struct {
 
     /// Open an environment created by `create`.
     ///
-    /// `path` is the sentinel-terminated slice as given; it is not copied and
-    /// not converted. On failure the handle is still valid and must be
+    /// `path` is borrowed for this call, with no interior NUL; the native core
+    /// stores its own copy (mdb.c:6338). On failure the handle must be
     /// released with `close` (lmdb.h:602-604), and it cannot be opened again:
     /// see below.
     ///
@@ -782,14 +1159,14 @@ pub const Environment = struct {
     /// caller learns which happened rather than being told its argument is
     /// invalid by the stale descriptor its own previous call left behind.
     /// Release the handle with `close` and create another.
-    pub fn open(self: *Environment, path: [:0]const u8, flags: EnvFlags, mode: Mode) Error!void {
+    pub fn open(self: *Environment, directory: [:0]const u8, options: EnvFlags, mode: Mode) Error!void {
         if (self.opened) return error.EnvironmentAlreadyOpen;
         if (self.open_attempted) return error.OpenFailed;
         const handle = try self.pending();
         // Set before the call, not after: on the failure path this handle is
         // spent even though nothing below knows it yet.
         self.open_attempted = true;
-        try check(c.mdb_env_open(handle, path.ptr, flags.bits(), mode));
+        try check(c.mdb_env_open(handle, directory.ptr, options.bits(), mode));
         self.opened = true;
     }
 
@@ -813,11 +1190,26 @@ pub const Environment = struct {
     /// database.
     ///
     /// Zero adopts the size another process persisted, which is the
-    /// documented answer to `error.MapResized` (lmdb.h:976-979). Must be
-    /// called before `open`, or afterwards only when no write transaction is
-    /// live in this process — a condition upstream does not check and this
-    /// facade does not invent; the C reports `EINVAL` when it notices
-    /// (mdb.c:5178-5185).
+    /// documented answer to `error.MapResized` (lmdb.h:976-979).
+    ///
+    /// Call it before `open`, or afterwards only when no transaction of
+    /// *either* kind is live in this process. That precondition is the
+    /// caller's, and upstream enforces only half of it: lmdb.h:967-969
+    /// states it in prose, and the C checks the write half alone —
+    /// `env->me_txn` (mdb.c:5184-5185), which is assigned only on the write
+    /// path of `mdb_txn_renew0` (mdb.c:3402) and cleared when that
+    /// transaction ends (mdb.c:3757).
+    ///
+    /// So a live *write* transaction is refused: `EINVAL` arrives here as
+    /// `error.InvalidArgument`, and the map is left as it was. A live
+    /// *read-only* transaction is not detected, and in the configuration
+    /// this package builds — `MDB_RPAGE_CACHE` is 1 without
+    /// `MDB_REMAP_CHUNKS` (lmdb.h:192-195), so `MDB_REMAPPING` is false
+    /// (mdb.c:2333-2337) — the C goes on to `munmap` the old mapping and map
+    /// the new one (mdb.c:5200-5205). Every `[]const u8` borrowed through
+    /// [`Transaction.get`] or a [`Cursor`] traversal points into unmapped
+    /// memory from that moment, and the next dereference of one faults.
+    /// This facade neither refuses the call nor repairs the borrow.
     pub fn setMapSize(self: *Environment, bytes: Size) Error!void {
         try check(c.mdb_env_set_mapsize(try self.pending(), bytes));
     }
@@ -843,6 +1235,229 @@ pub const Environment = struct {
         var readers: c_uint = 0;
         try check(c.mdb_env_get_maxreaders(try self.pending(), &readers));
         return @intCast(readers);
+    }
+
+    /// The largest key this environment will accept, in bytes.
+    ///
+    /// Depends on the page size, and only an open environment has one:
+    /// `mdb_env_open2` is where upstream computes `me_maxkey`
+    /// (mdb.c:5657-5659) and `mdb_env_get_maxkeysize` reads that field back
+    /// (mdb.c:12678-12682), which is what lmdb.h:1055-1057 means by "Can
+    /// only be used after #mdb_env_open()". A key is 1..this inclusive
+    /// (lmdb.h:288-292); a longer one travels to the C and comes back as
+    /// `error.BadValSize` (mdb.c:8605-8606).
+    ///
+    /// This is the one call in the surface whose return value is an answer
+    /// rather than a status — lmdb.h:1061 documents its return as "The
+    /// maximum size of a key we can write" — so it is the one return value
+    /// here that does not go through `check`. Every real answer is well above
+    /// zero, so `check` turned all of them into `positiveStatus`.
+    pub fn maxKeySize(self: *Environment) Error!u32 {
+        return @intCast(c.mdb_env_get_maxkeysize(try self.openHandle()));
+    }
+
+    /// Set the page size in bytes, before the open (lmdb.h:995-1002).
+    ///
+    /// Only a power of two between the minimum and maximum the operating
+    /// system supports is accepted; what those are is the platform's, and a
+    /// refusal comes back as `error.InvalidArgument`.
+    pub fn setPageSize(self: *Environment, bytes: c_int) Error!void {
+        try check(c.mdb_env_set_pagesize(try self.pending(), bytes));
+    }
+
+    /// The flags this environment is actually carrying.
+    ///
+    /// Read out of the handle, so it answers what the environment is using
+    /// rather than what a caller once asked for — which is the whole point,
+    /// because several flags may be changed after the open (lmdb.h:902-928).
+    pub fn flags(self: *Environment) Error!c_uint {
+        var bits: c_uint = 0;
+        try check(c.mdb_env_get_flags(try self.openHandle(), &bits));
+        return bits;
+    }
+
+    /// Set or clear environment flags on an open environment.
+    ///
+    /// `on` sets every bit in `mask` and clears them when false. Upstream lists
+    /// which flags may change after the open and which may not
+    /// (lmdb.h:613-726), and this passes the mask through rather than deciding
+    /// that for the caller. Not mutex protected: if several threads change
+    /// flags at once the result is undefined (lmdb.h:903-904).
+    pub fn setFlags(self: *Environment, mask: c_uint, on: bool) Error!void {
+        try check(c.mdb_env_set_flags(try self.openHandle(), mask, if (on) 1 else 0));
+    }
+
+    /// The path this environment was opened with, as upstream stored it.
+    ///
+    /// Not a copy: the header says the string belongs to the environment, must
+    /// not be altered, and is what `mdb_env_open` was given (lmdb.h:930-942).
+    /// Relative exactly as the caller wrote it, and gone with the environment.
+    pub fn path(self: *Environment) Error![:0]const u8 {
+        var text: ?[*:0]const u8 = null;
+        try check(c.mdb_env_get_path(try self.openHandle(), &text));
+        return text orelse error.UnexpectedStatus;
+    }
+
+    /// The descriptor the environment's data file is open on.
+    ///
+    /// `int` on POSIX and an opaque pointer on Windows (lmdb.h:221-225), which
+    /// is what [`FileHandle`] is. Zero is the absence of a descriptor. The
+    /// handle belongs to the environment and is closed by `close`; nothing
+    /// here duplicates or takes ownership of it.
+    pub fn fileHandle(self: *Environment) Error!FileHandle {
+        var handle: FileHandle = 0;
+        try check(c.mdb_env_get_fd(try self.openHandle(), &handle));
+        return handle;
+    }
+
+    /// Page and tree statistics for the environment as a whole, which for LMDB
+    /// is its main database.
+    ///
+    /// For one named database, ask inside a transaction with
+    /// [`Transaction.statistics`].
+    pub fn statistics(self: *Environment) Error!Statistics {
+        var raw: c.MDB_stat = undefined;
+        try check(c.mdb_env_stat(try self.openHandle(), &raw));
+        return .{
+            .page_size = raw.ms_psize,
+            .depth = raw.ms_depth,
+            .branch_pages = raw.ms_branch_pages,
+            .leaf_pages = raw.ms_leaf_pages,
+            .overflow_pages = raw.ms_overflow_pages,
+            .entries = raw.ms_entries,
+        };
+    }
+
+    /// What the environment knows about itself: where its map is, how large it
+    /// is, the last page and transaction identifiers, and how full the reader
+    /// table is.
+    pub fn info(self: *Environment) Error!EnvInfo {
+        var raw: c.MDB_envinfo = undefined;
+        try check(c.mdb_env_info(try self.openHandle(), &raw));
+        return .{
+            .map_address = raw.me_mapaddr,
+            .map_size = raw.me_mapsize,
+            .last_page = raw.me_last_pgno,
+            .last_txn = raw.me_last_txnid,
+            .max_readers = raw.me_maxreaders,
+            .num_readers = raw.me_numreaders,
+        };
+    }
+
+    /// Copy the environment into the directory `path`, with no options.
+    ///
+    /// `path` must already exist, be writable and otherwise be empty
+    /// (lmdb.h:731-745). The copy is taken through a read-only transaction of
+    /// its own, so a long-lived reader elsewhere can make it grow
+    /// (lmdb.h:737).
+    pub fn copy(self: *Environment, destination: [:0]const u8) Error!void {
+        try check(c.mdb_env_copy(try self.openHandle(), destination.ptr));
+    }
+
+    /// Copy the environment into `path` with options.
+    pub fn copyWithOptions(self: *Environment, destination: [:0]const u8, options: CopyFlags) Error!void {
+        try check(c.mdb_env_copy2(try self.openHandle(), destination.ptr, options.bits()));
+    }
+
+    /// Copy the environment onto a descriptor the caller has already opened for
+    /// writing (lmdb.h:787-804). No lock file is written; the copy gets one at
+    /// need.
+    pub fn copyToFileHandle(
+        self: *Environment,
+        handle: FileHandle,
+        options: CopyFlags,
+    ) Error!void {
+        try check(c.mdb_env_copyfd2(try self.openHandle(), handle, options.bits()));
+    }
+
+    /// Write everything committed after transaction `txn` into the new file
+    /// `path`, which must not already exist (lmdb.h:824-840).
+    pub fn dumpSince(self: *Environment, destination: [:0]const u8, txn: Size) Error!void {
+        try check(c.mdb_env_incr_dump(try self.openHandle(), destination.ptr, txn));
+    }
+
+    /// The same incremental dump, onto a descriptor the caller has opened for
+    /// writing (lmdb.h:806-822).
+    pub fn dumpSinceToFileHandle(self: *Environment, handle: FileHandle, txn: Size) Error!void {
+        try check(c.mdb_env_incr_dumpfd(try self.openHandle(), handle, txn));
+    }
+
+    /// Load an incremental dump back into the environment from `handle`.
+    ///
+    /// The environment must have been opened with `writemap` set
+    /// (lmdb.h:842-853), and no other task may touch the environment while this
+    /// runs (lmdb.h:847-848). Both are caller obligations upstream does not
+    /// check.
+    pub fn loadSinceFromFileHandle(self: *Environment, handle: FileHandle) Error!void {
+        try check(c.mdb_env_incr_loadfd(try self.openHandle(), handle));
+    }
+
+    /// Roll the environment back to the commit `txn` names.
+    ///
+    /// `txn` is the identifier [`Transaction.id`] reported for the transaction
+    /// to undo, and it has to be the *newest* committed one: upstream compares
+    /// it against the newest metapage and answers `error.CantRollback` for
+    /// anything else, including an older transaction and zero (mdb.c:4662-4665).
+    /// Nothing else may have committed since — the header requires that no
+    /// other process wrote to the environment between the commit and this call
+    /// (lmdb.h:1231-1241), and nothing in this module can check it.
+    ///
+    /// Upstream writes the previous metapage and moves the reader table's
+    /// transaction identifier with it (mdb.c:4676-4679), so readers begin from
+    /// the state before the transaction being undone.
+    pub fn rollback(self: *Environment, txn: Size) Error!void {
+        try check(c.mdb_env_rollback(try self.openHandle(), txn));
+    }
+
+    /// Store a pointer for the application to find again later.
+    ///
+    /// Stored, not copied and not owned (lmdb.h:1064-1070): whatever the
+    /// pointer names stays the caller's responsibility and nothing in this
+    /// module frees it.
+    pub fn setUserContext(self: *Environment, context: ?*anyopaque) Error!void {
+        try check(c.mdb_env_set_userctx(try self.pending(), context));
+    }
+
+    /// The pointer given to [`setUserContext`], unchanged (lmdb.h:1072-1077).
+    pub fn userContext(self: *Environment) Error!?*anyopaque {
+        return c.mdb_env_get_userctx(try self.pending());
+    }
+
+    /// Set or clear the assertion callback.
+    ///
+    /// Upstream calls it with the environment and the assertion message before
+    /// printing its own message and aborting (lmdb.h:1079-1094). The whole
+    /// mechanism is compiled out when liblmdb is built with `NDEBUG`; this
+    /// package passes no such define (`build.zig`, `c_flags` is only
+    /// `-std=gnu17`), so the callback is live in a provider built the same way.
+    /// Passing `null` removes it.
+    pub fn setAssertCallback(self: *Environment, callback: ?AssertCallback) Error!void {
+        try check(c.mdb_env_set_assert(try self.pending(), callback));
+    }
+
+    /// Print the reader lock table through `callback`.
+    ///
+    /// `context` is handed back to the callback untouched; it is neither copied
+    /// nor freed by anything here. A callback that returns a negative number
+    /// stops the listing (lmdb.h:1828-1834), and that number is what this
+    /// returns, so a caller can tell "the table ran out" from "the callback
+    /// refused". Callback results, negative or nonnegative, are not LMDB error
+    /// statuses and are returned unchanged. The error union only reports an
+    /// environment that is closed or has not been opened.
+    pub fn listReaders(self: *Environment, callback: MessageCallback, context: ?*anyopaque) Error!c_int {
+        const status = c.mdb_reader_list(try self.openHandle(), callback, context);
+        return status;
+    }
+
+    /// Reclaim reader lock-table slots whose owning thread has gone, answering
+    /// how many were reclaimed (lmdb.h:1845-1851).
+    ///
+    /// Zero is the ordinary answer and is not an error; a table that is full
+    /// because nothing has died is full, and freeing memory does not help.
+    pub fn clearStaleReaders(self: *Environment) Error!c_int {
+        var dead: c_int = 0;
+        try check(c.mdb_reader_check(try self.openHandle(), &dead));
+        return dead;
     }
 
     /// Flush the data buffers to disk.
@@ -872,14 +1487,16 @@ pub const Environment = struct {
 
     /// Begin a read-only transaction, which sees the last committed snapshot.
     ///
-    /// Several read-only transactions may be live at once, but a read-only
-    /// transaction holds the pages its snapshot needs; keeping one open for a
-    /// long time makes the database grow (lmdb.h:1278-1281).
+    /// Several readers can coexist when the native thread/`notls` rules permit
+    /// them. A reader holds its snapshot's pages; a long-lived one can make the
+    /// database grow (lmdb.h:1278-1281). The result borrows this wrapper's stable
+    /// address until commit or abort.
     pub fn beginReadOnly(self: *Environment) Error!Transaction {
         return self.begin(true);
     }
 
-    /// Begin a read-write transaction. Only one may be live per environment.
+    /// Begin a read-write transaction, borrowing this wrapper's stable address.
+    /// Waits for the single writer slot; no cancellation channel is provided.
     pub fn beginWrite(self: *Environment) Error!Transaction {
         return self.begin(false);
     }
@@ -887,14 +1504,15 @@ pub const Environment = struct {
     fn begin(self: *Environment, read_only: bool) Error!Transaction {
         const handle = try self.openHandle();
         var out: ?*c.MDB_txn = null;
-        const flags: c_uint = if (read_only) @intCast(c.MDB_RDONLY) else 0;
-        const txn = try checkOut(c.MDB_txn, c.mdb_txn_begin(handle, null, flags, &out), out);
+        const txn_flags: c_uint = if (read_only) @intCast(c.MDB_RDONLY) else 0;
+        const txn = try checkOut(c.MDB_txn, c.mdb_txn_begin(handle, null, txn_flags, &out), out);
         return .{
             .handle = txn,
             .env = self,
             .read_only = read_only,
             .nested = false,
             .suspended = false,
+            .prepared = false,
         };
     }
 
@@ -912,32 +1530,93 @@ pub const Environment = struct {
     }
 };
 
+/// Page encryption and plain checksums, where the header declares them.
+///
+/// `mdb_env_set_encrypt` and `mdb_env_set_checksum` sit inside
+/// `#if MDB_RPAGE_CACHE` (lmdb.h:317-342, :1096-1119) together with the
+/// callback typedefs they take. `lmdb.h:192-195` defines that macro to 1
+/// unless `MDB_VL32` is defined, and this package defines neither, so both are
+/// in this build's translation and both are in the provider's table. A header
+/// without them — an older installed `lmdb.h` under `-fsys=lmdb`, say — leaves
+/// this as `void`, and `c` carries no declaration to call either, so a program
+/// written against them cannot be built against one without them. That is a
+/// property of the header, stated here rather than papered over.
+///
+/// Both setters must be called before [`Environment.open`] (lmdb.h:1099-1102,
+/// :1111-1113) and encryption implies `MDB_REMAP_CHUNKS` (lmdb.h:1100-1102).
+pub const Encryption = if (@hasDecl(c, "mdb_env_set_encrypt")) struct {
+    /// Upstream's page encryption callback, `MDB_enc_func` (lmdb.h:318-330).
+    /// The library calls it for every page it reads and every page it writes;
+    /// the source and the key come out of the map and the destination is
+    /// storage the callback owns for the duration of the call.
+    pub const Callback = c.MDB_enc_func;
+
+    /// Upstream's page checksum callback, `MDB_sum_func` (lmdb.h:332-341). It
+    /// writes the checksum into `dst`; the bytes there belong to the library
+    /// for the length the setter below was given.
+    pub const ChecksumCallback = c.MDB_sum_func;
+
+    /// Encrypt this environment's pages with `callback`.
+    ///
+    /// `key` is the encryption key as one `MDB_val`, and `auth_data_size` is the
+    /// number of bytes of authentication data the callback expects alongside it
+    /// (lmdb.h:1104-1107). The callback is the caller's own function: the
+    /// library calls back into it during page access and retains nothing of
+    /// it, so it must stay valid and reachable for the life of the
+    /// environment. `MDB_ENCRYPT` is set by the library rather than by the
+    /// caller, so it is not in [`EnvFlags`].
+    pub fn set(env: *Environment, callback: Callback, key: []const u8, auth_data_size: c_uint) Error!void {
+        var key_value = dataValue(key);
+        try check(c.mdb_env_set_encrypt(try env.pending(), callback, &key_value, auth_data_size));
+    }
+
+    /// Checksum this environment's pages with `callback`, `size` bytes wide.
+    ///
+    /// A plain checksum rather than authenticated encryption: the callback
+    /// receives the page and writes `size` bytes into the page's checksum
+    /// field (lmdb.h:1110-1118). The same ownership rule as [`set`] applies —
+    /// the callback stays the caller's for the life of the environment.
+    pub fn setChecksum(env: *Environment, callback: ChecksumCallback, size: c_uint) Error!void {
+        try check(c.mdb_env_set_checksum(try env.pending(), callback, size));
+    }
+} else void;
+
 // -------------------------------------------------------------- transaction
 
 /// A transaction: the unit of isolation, and the lifetime that everything
 /// borrowed from the database is bound to.
 ///
-/// Owns its `MDB_txn`. `commit` and `abort` both release it, and both are
-/// safe to reach more than once, so the ordinary
-/// `defer txn.abort(); …; try txn.commit();` shape does not double free.
+/// Construct through an environment or `beginNested`, and preserve the fields.
+/// One owner spends its handle with commit or abort; do not independently clean
+/// up copies. Abort is idempotent on the same wrapper. A repeated commit returns
+/// `error.TransactionClosed`, so `defer txn.abort(); try txn.commit();` is safe.
 ///
-/// A transaction and its cursors belong to one thread (lmdb.h:1124-1127).
+/// Close every read cursor before commit, abort or reset. Those operations
+/// invalidate borrowed bytes. The cleanup order is a caller precondition, not
+/// a tracked property. Keep this wrapper at one address while cursors borrow it.
+/// Transactions and cursors obey the native thread/`notls` rules
+/// (lmdb.h:1124-1127); a copied wrapper does not grant concurrent use.
 pub const Transaction = struct {
+    /// Owned native transaction, or `null` after commit/abort. Do not alter it.
     handle: ?*c.MDB_txn,
-    /// The environment this transaction was begun on. Borrowed: it must
-    /// outlive the transaction, and closing it first is what upstream forbids
-    /// at lmdb.h:892-897.
+    /// Borrowed environment wrapper. It must remain alive, open and at the same
+    /// address until this transaction ends; `beginNested` dereferences it.
     env: *Environment,
     /// Whether this is a read-only transaction. Read from the request rather
     /// than from the handle, because it decides cursor ownership — see
     /// [`Cursor.close`] — and stays meaningful after the handle is released.
     read_only: bool,
-    /// Whether this is a nested transaction. A nested transaction's cursors
-    /// are merged into its parent, not freed away from it.
+    /// Whether this is a nested transaction. Its cursors transfer to the
+    /// parent on commit; on abort the native transaction releases them.
     nested: bool,
     /// Set between `reset` and `renew`, while the C has released the reader
     /// lock and no data operation is valid.
     suspended: bool,
+    /// Set after `prepare`, once the data pages are on disk and only the
+    /// metapage update is left (lmdb.h:1208-1229). A prepared transaction has
+    /// no valid data operation; only `commit` and `abort` are, and the C has
+    /// already closed every cursor that belonged to it.
+    prepared: bool,
 
     /// Begin a nested transaction inside this one.
     ///
@@ -955,6 +1634,7 @@ pub const Transaction = struct {
             .read_only = false,
             .nested = true,
             .suspended = false,
+            .prepared = false,
         };
     }
 
@@ -972,11 +1652,11 @@ pub const Transaction = struct {
     /// Upstream also forbids calling this from two concurrent transactions in
     /// one process: a transaction that opens a database must finish before
     /// another may (lmdb.h:1321-1324).
-    pub fn openDatabase(self: *Transaction, name: ?[:0]const u8, flags: DbFlags) Error!Database {
+    pub fn openDatabase(self: *Transaction, name: ?[:0]const u8, options: DbFlags) Error!Database {
         const handle = try self.active();
         var dbi: c.MDB_dbi = 0;
         const name_ptr: [*c]const u8 = if (name) |n| n.ptr else null;
-        try check(c.mdb_dbi_open(handle, name_ptr, flags.bits(), &dbi));
+        try check(c.mdb_dbi_open(handle, name_ptr, options.bits(), &dbi));
         return .{ .dbi = dbi };
     }
 
@@ -985,6 +1665,30 @@ pub const Transaction = struct {
     /// The bytes are copied into the database during this call, so `key` and
     /// `value` need not outlive it. In a `DUPSORT` database this *adds* a
     /// duplicate rather than replacing one (lmdb.h:1541-1545).
+    ///
+    /// ## What a failed overwrite leaves behind
+    ///
+    /// An error from this call is not proof that nothing changed. When
+    /// `key` is already there and the new value cannot be written over the
+    /// stored one in place, upstream deletes the stored node and inserts
+    /// afterwards: a plain database whose value size differs takes the
+    /// `mdb_node_del` at mdb.c:8968, one whose stored value sits in an
+    /// overflow page frees that page first and falls through to the same
+    /// place (mdb.c:8892-8952), and a `DUPSORT` database whose sub-page has
+    /// to grow deletes the key's node at mdb.c:8884. The insert is the part
+    /// that fails (mdb.c:8973-8984): `MDB_MAP_FULL` (mdb.c:2862-2864),
+    /// `MDB_TXN_FULL` (mdb.c:2964-2965), `MDB_PAGE_FULL`
+    /// (mdb.c:9443-9449) or `ENOMEM` (mdb.c:3063-3066).
+    ///
+    /// By then this transaction no longer has the old value:
+    /// [`Transaction.get`] answers `error.NotFound` and a [`Cursor`] over
+    /// the database no longer sees the key. Each of those paths also marks
+    /// the transaction failed (`MDB_TXN_ERROR`, mdb.c:2924, :3106, :9448,
+    /// :11100), so [`Transaction.commit`] cannot make that gap permanent —
+    /// it is refused with `MDB_BAD_TXN` (mdb.c:4411-4417), which arrives as
+    /// `error.BadTxn`, and the C aborts the transaction on the way out
+    /// (mdb.c:4633-4635). Aborting leaves the stored value intact. Read
+    /// the error as the end of this transaction, not as a failed no-op.
     pub fn put(self: *Transaction, db: Database, key: []const u8, value: []const u8) Error!void {
         return self.store(db, key, value, 0);
     }
@@ -1065,8 +1769,9 @@ pub const Transaction = struct {
 
     /// Open a cursor over `db` inside this transaction.
     ///
-    /// The cursor borrows `self` and must not outlive it. How it is released
-    /// depends on the kind of transaction; see [`Cursor.close`].
+    /// The cursor borrows this wrapper's stable address. Close a read cursor
+    /// before committing, aborting or resetting the transaction. A write cursor's
+    /// native allocation belongs to the transaction; see `Cursor.close`.
     pub fn openCursor(self: *Transaction, db: Database) Error!Cursor {
         const handle = try self.active();
         var out: ?*c.MDB_cursor = null;
@@ -1076,10 +1781,10 @@ pub const Transaction = struct {
 
     /// Commit everything this transaction did, and release it.
     ///
-    /// The handle is released whether this succeeds or fails: upstream frees
-    /// it on the success path and aborts it on every failure path
-    /// (mdb.c:4383-4637). The handle is cleared before the call, so a
-    /// `defer`red [`abort`] that runs afterwards does nothing.
+    /// Close all read cursors first. The transaction is spent whether this
+    /// succeeds or fails (mdb.c:4629-4635); its allocation may be recycled.
+    /// The handle is cleared before C, so a deferred `abort` does nothing.
+    /// A later commit returns `error.TransactionClosed`.
     ///
     /// In a `DUPSORT` database nothing here is atomic per pair — the whole
     /// transaction is.
@@ -1092,11 +1797,46 @@ pub const Transaction = struct {
     /// Nothing is written; a later reader sees the last committed state. Safe
     /// after `commit`, and safe twice: with no handle left there is nothing to
     /// abandon.
+    /// Close all read cursors first; this also invalidates all borrowed bytes.
     pub fn abort(self: *Transaction) void {
         const handle = self.handle orelse return;
         self.handle = null;
         self.suspended = false;
+        self.prepared = false;
         c.mdb_txn_abort(handle);
+    }
+
+    /// Write this transaction's data pages but not the metapage, leaving it
+    /// prepared for the second half of a two-phase commit.
+    ///
+    /// On success the handle stays alive — that is the whole point — and every
+    /// cursor on the transaction has been closed by the C (mdb.c:4557,
+    /// lmdb.h:1212-1213). Afterwards only [`commit`] and [`abort`] are
+    /// defined, and the facade says so: every other method here, and every
+    /// traversal on a cursor that borrowed this transaction, answers
+    /// `error.TxnPending` rather than reaching a transaction the C considers
+    /// half-finished. [`commit`] writes the metapage and frees the handle
+    /// (mdb.c:4615-4631); [`abort`] throws the data pages away.
+    ///
+    /// A *nested* transaction has no metapage of its own, so upstream treats
+    /// this as a commit: the child's pages are merged into the parent and the
+    /// child is freed (mdb.c:4419-4548), and the parent's `mt_flags` is
+    /// overwritten with the child's, which does not carry the prepare bit
+    /// (mdb.c:4436). Nothing is left prepared, so this wrapper is spent
+    /// exactly as [`commit`] would have spent it and a later commit is
+    /// `error.TransactionClosed`.
+    ///
+    /// A second `prepare` on the same transaction is `error.TxnPending`,
+    /// which is also upstream's own answer (mdb.c:4649-4650).
+    pub fn prepare(self: *Transaction) Error!void {
+        const handle = try self.active();
+        try check(c.mdb_txn_prepare(handle));
+        if (self.nested) {
+            self.handle = null;
+            self.suspended = false;
+            return;
+        }
+        self.prepared = true;
     }
 
     /// Release this read-only transaction's snapshot but keep the handle, so
@@ -1111,6 +1851,9 @@ pub const Transaction = struct {
     ///
     /// Releasing the snapshot is the point: it lets writers reuse the pages
     /// this reader was pinning (lmdb.h:1278-1281).
+    ///
+    /// Close this transaction's read cursors before reset. The snapshot's
+    /// borrowed bytes become invalid; renewed use needs newly opened cursors.
     pub fn reset(self: *Transaction) Error!void {
         const handle = self.handle orelse return error.TransactionClosed;
         if (self.suspended) return error.TransactionNotResettable;
@@ -1130,17 +1873,211 @@ pub const Transaction = struct {
         self.suspended = false;
     }
 
+    /// This transaction's identifier (lmdb.h:1171-1180).
+    ///
+    /// Assigned by the library and meaningful only while the transaction is
+    /// active. It is the value [`Environment.rollback`] names, and it is also
+    /// the value [`Environment.dumpSince`] asks an incremental dump to start
+    /// from. Not a byte count and not ordered between environments.
+    pub fn id(self: *Transaction) Error!Size {
+        const handle = try self.active();
+        return c.mdb_txn_id(handle);
+    }
+
+    /// The flags this transaction was begun with (lmdb.h:1182-1188).
+    ///
+    /// Read out of the C rather than echoed from what this wrapper recorded at
+    /// `begin`, so it is the library's own answer.
+    pub fn flags(self: *Transaction) Error!c_uint {
+        var bits: c_uint = 0;
+        try check(c.mdb_txn_flags(try self.active(), &bits));
+        return bits;
+    }
+
+    /// The environment handle the C says this transaction belongs to
+    /// (lmdb.h:1165-1169).
+    ///
+    /// Borrowed, and the same handle this wrapper's [`Transaction.env`] points
+    /// at; it is here for the callback and logging paths that want the C's own
+    /// answer rather than the wrapper's copy.
+
+    /// Upstream answers `NULL` only for a null transaction (mdb.c:3643), and
+    /// `active` has already refused one, so a null from a transaction that is
+    /// live is `error.UnexpectedStatus` rather than a handle to pass on.
+    pub fn environment(self: *Transaction) Error!*c.MDB_env {
+        const handle = try self.active();
+        return c.mdb_txn_env(handle) orelse error.UnexpectedStatus;
+    }
+
+    /// Page and tree statistics for one database in this environment
+    /// (lmdb.h:1380-1392).
+    ///
+    /// The same shape [`Environment.statistics`] returns; this one is scoped to
+    /// the `MDB_dbi` the caller names rather than to the main database.
+    pub fn statistics(self: *Transaction, db: Database) Error!Statistics {
+        var raw: c.MDB_stat = undefined;
+        try check(c.mdb_stat(try self.active(), db.dbi, &raw));
+        return .{
+            .page_size = raw.ms_psize,
+            .depth = raw.ms_depth,
+            .branch_pages = raw.ms_branch_pages,
+            .leaf_pages = raw.ms_leaf_pages,
+            .overflow_pages = raw.ms_overflow_pages,
+            .entries = raw.ms_entries,
+        };
+    }
+
+    /// The flags `db` was created with (lmdb.h:1394-1401).
+    pub fn databaseFlags(self: *Transaction, db: Database) Error!c_uint {
+        var bits: c_uint = 0;
+        try check(c.mdb_dbi_flags(try self.active(), db.dbi, &bits));
+        return bits;
+    }
+
+    /// Empty `db`, or delete it from the environment and close its handle
+    /// (lmdb.h:1421-1430).
+    ///
+    /// `delete` false removes every entry and leaves the database in place;
+    /// true removes a *named* database as well. The two are not the same for
+    /// the main database, which cannot be deleted at all: there `true` only
+    /// empties it (mdb.c:12616-12617).
+    ///
+    /// A named database whose handle this call closes is spent — its slot goes
+    /// stale and back to the environment (mdb.c:12620-12621) — so
+    /// [`Environment.closeDatabase`] must not be called on it afterwards. A
+    /// database that was only emptied, and the main database under either
+    /// setting, keeps its handle and is still released that way.
+    ///
+    /// Each refusal is upstream's own: a read-only transaction is
+    /// `error.IsReadOnly` (mdb.c:12540-12541), a handle this transaction has
+    /// itself changed is `error.BadDbi` (mdb.c:12543-12544), and dropping the
+    /// main database while another database handle is open is
+    /// `error.DbisBusy` (mdb.c:12562-12565).
+    pub fn drop(self: *Transaction, db: Database, delete_database: bool) Error!void {
+        try check(c.mdb_drop(try self.active(), db.dbi, if (delete_database) 1 else 0));
+    }
+
+    /// Install a custom key comparator for `db` (lmdb.h:1432-1451).
+    ///
+    /// Upstream's warning is a rule, not advice: the comparator must be in
+    /// place before *any* data access on the database, and every program that
+    /// opens this database must use this same comparator, every time, or the
+    /// tree they read is not the tree the others wrote (lmdb.h:1438-1441). This
+    /// module cannot check either, so the obligation stays with the caller.
+    ///
+    /// The function is called by the library during page access, on the
+    /// library's own stack, with two `MDB_val` items out of the map. It must
+    /// not call back into the environment that owns `db`, and it must not
+    /// retain either pointer.
+    pub fn setKeyComparator(self: *Transaction, db: Database, comparator: KeyComparator) Error!void {
+        try check(c.mdb_set_compare(try self.active(), db.dbi, comparator));
+    }
+
+    /// Install a custom comparator for a `DUPSORT` database's duplicate data
+    /// (lmdb.h:1453-1474, mdb.c:12651-12658).
+    ///
+    /// Same two obligations as [`setKeyComparator`]: install before any data
+    /// access, and use the same comparator in every program that opens the
+    /// database, every time (lmdb.h:1462-1464). A handle that is not a valid
+    /// user database is `error.InvalidArgument` (mdb.c:12653-12654).
+    ///
+    /// Upstream stores the function whatever `db` was opened with — the call
+    /// tests only that the handle exists (mdb.c:12651-12658) and never looks
+    /// at `MDB_DUPSORT`, so there is no `MDB_INCOMPATIBLE` here — and
+    /// lmdb.h:1457-1458 says what the store is for: the function "only takes
+    /// effect if the database was opened with the #MDB_DUPSORT flag". Inside
+    /// the library that is literally true: `md_dcmp` is read only from the
+    /// `MDB_DUPSORT` branches (mdb.c:8206-8209, :8768-8771). The one other
+    /// reader is [`compareValues`], which calls it whatever the flags are —
+    /// which is how a database without duplicates gets an ordering at all.
+    pub fn setValueComparator(self: *Transaction, db: Database, comparator: KeyComparator) Error!void {
+        try check(c.mdb_set_dupsort(try self.active(), db.dbi, comparator));
+    }
+
+    /// Install a relocation function for a `MDB_FIXEDMAP` database
+    /// (lmdb.h:1476-1494).
+    ///
+    /// Upstream records the function and its context; the feature itself is
+    /// marked unimplemented in this release (lmdb.h:313), so nothing calls it.
+    /// It is wrapped because the surface is part of the header and a caller may
+    /// be written against a provider where it is not.
+    pub fn setRelocation(self: *Transaction, db: Database, relocation: RelocationCallback) Error!void {
+        try check(c.mdb_set_relfunc(try self.active(), db.dbi, relocation));
+    }
+
+    /// The pointer a [`setRelocation`] function receives as its `relctx`
+    /// (lmdb.h:1496-1510).
+    ///
+    /// Stored, not copied and not owned. Nothing here frees it and the library
+    /// never does either.
+    pub fn setRelocationContext(
+        self: *Transaction,
+        db: Database,
+        context: ?*anyopaque,
+    ) Error!void {
+        try check(c.mdb_set_relctx(try self.active(), db.dbi, context));
+    }
+
+    /// Compare two keys exactly as `db` orders them (lmdb.h:1804-1814).
+    ///
+    /// Negative, zero or positive as `a` sorts before, with, or after `b`.
+    /// Neither argument is copied and neither is retained; the library reads
+    /// both and answers, and the comparator it uses is whatever `db` was opened
+    /// with — a custom one installed by [`setKeyComparator`] included.
+    pub fn compareKeys(self: *Transaction, db: Database, a: []const u8, b: []const u8) Error!c_int {
+        const handle = try self.active();
+        const left = dataValue(a);
+        const right = dataValue(b);
+        return c.mdb_cmp(handle, db.dbi, &left, &right);
+    }
+
+    /// Compare two data items as `db` orders its duplicate values
+    /// (lmdb.h:1816-1826, mdb.c:2219-2226).
+    ///
+    /// Negative, zero or positive as `a` sorts before, with, or after `b`.
+    /// This is a comparison and not a status — a negative result is an
+    /// ordering, never an error.
+    ///
+    /// `db` must have been opened with `dupsort`: that is the precondition
+    /// lmdb.h:1821 states, and it is not a formality. A database opened
+    /// without the flag is given a *null* `md_dcmp` (mdb.c:12258-12259) and
+    /// `mdb_dcmp` calls that pointer with no check at all (mdb.c:2222-2225),
+    /// so the call cannot answer: it jumps to address zero, and what happens
+    /// there is the machine's business rather than a status upstream reports.
+    /// There is no return code to refuse it with — the flag is the whole of the
+    /// protection, and this module does not invent one it was not asked for.
+    ///
+    /// Given the flag, the answer is the database's own duplicate comparator:
+    /// the one installed by [`setValueComparator`] where there is one, and
+    /// otherwise the default `mdb_cmp_memn` — byte-lexicographic with the
+    /// shorter item first (mdb.c:6659-6675) — or the integer or reversed
+    /// variant the `dupsort` flags asked for (mdb.c:12258-12262).
+    pub fn compareValues(self: *Transaction, db: Database, a: []const u8, b: []const u8) Error!c_int {
+        const handle = try self.active();
+        const left = dataValue(a);
+        const right = dataValue(b);
+        return c.mdb_dcmp(handle, db.dbi, &left, &right);
+    }
+
     /// A live `MDB_txn` for a data operation, or the reason there is none.
     fn active(self: *Transaction) Error!*c.MDB_txn {
         const handle = self.handle orelse return error.TransactionClosed;
         if (self.suspended) return error.TransactionReset;
+        if (self.prepared) return error.TxnPending;
         return handle;
     }
 
     /// Take the handle away, so that whichever C call frees it cannot be
     /// reached twice through this transaction.
+    ///
+    /// Unlike [`active`], this accepts a prepared transaction: `commit` is the
+    /// second half of what `prepare` started and `abort` is the way out of it,
+    /// so a prepared transaction is exactly the one that must still be spendable.
+    /// A *reset* transaction is refused here as well, because the C has already
+    /// finished it.
     fn take(self: *Transaction) Error!*c.MDB_txn {
-        const handle = try self.active();
+        const handle = self.handle orelse return error.TransactionClosed;
+        if (self.suspended) return error.TransactionReset;
         self.handle = null;
         return handle;
     }
@@ -1150,11 +2087,11 @@ pub const Transaction = struct {
 
 /// A handle for one database in an environment.
 ///
-/// This is a value, an index into the environment's slot table, and stays
-/// valid for the life of the environment. It is deliberately not a resource
-/// with a `deinit`: upstream frees the slot only in
-/// [`Environment.closeDatabase`], and only when no live transaction has
-/// modified that database (lmdb.h:1403-1418).
+/// An independently copyable slot index, not an owner with a `deinit`. Obtain
+/// it through `Transaction.openDatabase`; do not substitute an arbitrary index.
+/// A newly opened slot is private to that transaction until commit and may be
+/// invalidated by abort. Once published it lives until environment close or
+/// `Environment.closeDatabase` (lmdb.h:1315-1324, :1403-1418).
 pub const Database = struct {
     dbi: c.MDB_dbi,
 };
@@ -1163,22 +2100,17 @@ pub const Database = struct {
 
 /// A cursor over one database inside one transaction.
 ///
-/// Owns its `MDB_cursor`. Which side releases it is decided by the kind of
-/// transaction that made it, and the rule comes straight out of lmdb.h:
+/// Construct with `Transaction.openCursor`; preserve the returned fields.
+/// A copy duplicates the native pointer and may not be independently closed.
 ///
-///   * A cursor in a **read-only** transaction is never freed by the
-///     transaction, and "must be closed explicitly, before or after its
-///     transaction ends" (lmdb.h:1622-1624). [`close`] does exactly that, and
-///     is safe whichever order the cursor and the transaction are released
-///     in.
-///   * A cursor in a **write** transaction "can be closed before its
-///     transaction ends, and will otherwise be closed when its transaction
-///     ends" (lmdb.h:1620-1621). The C frees it on the commit path
-///     (mdb.c:4557) and on the abort path (mdb.c:3737-3738), and a nested
-///     transaction's cursors are merged into its parent instead
-///     (mdb.c:4439). [`close`] therefore does not call `mdb_cursor_close` for
-///     one: the transaction owns that pointer, and freeing it here would be a
-///     double free.
+/// A read cursor owns its native allocation: close it while its transaction
+/// is live, before commit, abort or reset. The header permits later closure
+/// (lmdb.h:1622-1624), but this core's page-cache cleanup dereferences the
+/// transaction (mdb.c:9786). No allocation registry enforces the order.
+///
+/// A write cursor's allocation belongs to its transaction. `close` only spends
+/// the Zig wrapper; native commit/abort frees the allocation, or a nested
+/// commit transfers it to the parent (mdb.c:3737-3738, :4439, :4557).
 ///
 /// The bytes every traversal returns are borrowed from the memory map and are
 /// valid until the transaction's next update operation or the end of the
@@ -1190,31 +2122,25 @@ pub const Database = struct {
 /// (mdb.c:4439-4444). Open a cursor in the transaction you intend to keep
 /// using, or reopen it there.
 pub const Cursor = struct {
+    /// Native pointer while the wrapper is live, or `null` after close.
+    /// Do not free or replace it; its native owner depends on `read_only`.
     handle: ?*c.MDB_cursor,
-    /// The transaction this cursor was opened in. Borrowed, and must not be
-    /// moved or reassigned while the cursor is live: every traversal reads it
-    /// to tell a live transaction from a spent one. A cursor may not span
-    /// transactions (lmdb.h:1127).
+    /// Borrowed transaction wrapper. Keep it alive at this address while this
+    /// cursor is open and used. A closed cursor no longer dereferences it;
+    /// traversal then returns `error.CursorClosed`. Cursors do not span transactions.
     owner: *Transaction,
-    /// Whether `owner` is a read-only transaction, captured when the cursor
-    /// was opened.
-    ///
-    /// Recorded rather than re-read, because the header lets a read-only
-    /// cursor outlive its transaction and be closed "before or after" it
-    /// ends (lmdb.h:1622-1624): by then `owner` may itself be out of scope,
-    /// and `close` must still be safe. It is the only field `close` consults.
+    /// Native ownership kind captured by `openCursor`. Do not change it:
+    /// read cursors need explicit native release, write cursors do not.
     read_only: bool,
 
     /// Release this cursor.
     ///
-    /// Read-only transaction: calls `mdb_cursor_close`, as the header
-    /// requires, and does so safely even if the transaction already ended —
-    /// a read-only transaction never frees its cursors, and `mdb_cursor_close`
-    /// does not look inside one (mdb.c:9788-9792).
+    /// For a read cursor, the transaction must still be live and not reset.
+    /// This caller precondition is unchecked; C cleanup reads the transaction.
     ///
-    /// Write transaction: leaves the pointer to the transaction, which frees
-    /// it when it commits or aborts. Either way the cursor is spent
-    /// afterwards.
+    /// For a write cursor, leave the native pointer to its transaction, which
+    /// frees it on commit/abort. The Zig wrapper may be closed afterwards
+    /// without dereferencing the transaction.
     ///
     /// A second `close` does nothing; any traversal after it returns
     /// `error.CursorClosed`.
@@ -1351,7 +2277,9 @@ pub const Cursor = struct {
     /// The key must still be supplied and must match the one the cursor is
     /// on. In a `DUPSORT` database the new value must still sort into the
     /// same place, and upstream turns the operation into a delete and insert
-    /// when the size changes (lmdb.h:1717-1722).
+    /// when the size changes (lmdb.h:1717-1722). The delete comes first, so
+    /// a failure in the insert leaves this transaction without the item —
+    /// the same gap [`Transaction.put`] describes.
     pub fn putCurrent(self: *Cursor, key: []const u8, value: []const u8) Error!void {
         const handle = try self.live();
         var k = try keyValue(key);
@@ -1389,6 +2317,88 @@ pub const Cursor = struct {
         return n;
     }
 
+    /// Point this cursor at `txn`, which may be a different transaction from
+    /// the one it was opened in (lmdb.h:1646-1662, mdb.c:9726-9740).
+    ///
+    /// The header presents this as the way a cursor outlives its transaction
+    /// (lmdb.h:1192-1194, :1259-1262); what that is worth depends on the kind
+    /// of transaction the cursor came from, and the section below says which.
+    /// The wrapper's ownership follows the native one: `owner` and the
+    /// read/write kind are re-read from `txn`, because which call releases a
+    /// cursor is decided by the kind of transaction it is in (see [`close`]).
+    ///
+    /// Every byte the cursor had borrowed went with the old transaction, and
+    /// the cursor is unpositioned afterwards, so the next traversal is a seek
+    /// again.
+    ///
+    /// Upstream's refusals: a cursor the environment does not track, or a new
+    /// transaction that already has cursors of its own, is
+    /// `error.InvalidArgument` (mdb.c:9732-9733); a transaction with a live
+    /// child is `error.BadTxn` (mdb.c:9735-9736); a database handle the new
+    /// transaction cannot see is `error.InvalidArgument` (mdb.c:9729-9730).
+    ///
+    /// ## What this core does with the old transaction
+    ///
+    /// The header says a cursor may be renewed after its transaction has ended
+    /// (lmdb.h:1192-1194, :1259-1262), and for a *read-only* transaction that
+    /// holds: ending one leaves a read cursor's allocation alone and frees the
+    /// reader's slot. It does not hold for a write cursor. Committing or
+    /// aborting one calls `mdb_cursors_close(txn, 0)` (mdb.c:4557), which frees
+    /// every tracked cursor on the transaction (mdb.c:3202-3227), so a write
+    /// cursor's pointer is dangling from the moment its transaction ends and
+    /// renewing it reads freed memory.
+    ///
+    /// So renew a cursor whose old transaction was read-only, or one whose old
+    /// transaction is still live. This facade does not refuse the other case:
+    /// it cannot know what the C did to the allocation, and turning away a call
+    /// upstream performs would be worse than stating the boundary.
+    pub fn renew(self: *Cursor, txn: *Transaction) Error!void {
+        const handle = self.handle orelse return error.CursorClosed;
+        try check(c.mdb_cursor_renew(try txn.active(), handle));
+        self.owner = txn;
+        self.read_only = txn.read_only;
+    }
+
+    /// The transaction handle the C says this cursor belongs to
+    /// (lmdb.h:1664-1668).
+
+    /// Upstream answers `NULL` only for a null cursor (mdb.c:9806), and
+    /// `live` has already refused one, so a null from a live cursor is
+    /// `error.UnexpectedStatus` rather than a handle to pass on.
+    pub fn transaction(self: *Cursor) Error!*c.MDB_txn {
+        return c.mdb_cursor_txn(try self.live()) orelse error.UnexpectedStatus;
+    }
+
+    /// The database handle this cursor was opened on (lmdb.h:1670-1674).
+    pub fn database(self: *Cursor) Error!c.MDB_dbi {
+        return c.mdb_cursor_dbi(try self.live());
+    }
+
+    /// Whether the record the cursor is on is a named database's entry in the
+    /// main database's catalogue rather than a user record (lmdb.h:1676-1681,
+    /// mdb.c:9816-9826).
+    ///
+    /// This is how a walk of the main database distinguishes the records that
+    /// name sub-databases from the records the application stored: those keys
+    /// are the database names with their terminator, and those values are the
+    /// sub-databases' `MDB_db` records in opaque bytes.
+    ///
+    /// Upstream reports the answer in the return value rather than in a status
+    /// code: 1 for yes, 0 for no. A cursor that has never been positioned
+    /// answers `false` rather than refusing, because `mdb_cursor_init` leaves
+    /// `mc_snum` at zero and clears `C_INITIALIZED` (mdb.c:9673-9678), and
+    /// `mdb_cursor_is_db` asks about that flag and `mc_snum` (mdb.c:9820).
+    ///
+    /// A cursor that has *run off the end* is a different case and does not
+    /// answer `false`: running past the last record sets `C_EOF` and returns
+    /// `MDB_NOTFOUND` while leaving `C_INITIALIZED` and the record index alone
+    /// (mdb.c:7912-7917), so the cursor is still on the record it last reached
+    /// and this still reports about it. `MDB_NOTFOUND` from the walk is what
+    /// says the walk is over; this cannot be asked to say it.
+    pub fn onNamedDatabase(self: *Cursor) Error!bool {
+        return c.mdb_cursor_is_db(try self.live()) != 0;
+    }
+
     /// Run one `mdb_cursor_get`, with the two optional inputs a cursor
     /// operation may need.
     ///
@@ -1417,7 +2427,8 @@ pub const Cursor = struct {
 
     /// A live `MDB_cursor` whose transaction can still be used.
     fn live(self: *Cursor) Error!*c.MDB_cursor {
+        const handle = self.handle orelse return error.CursorClosed;
         _ = try self.owner.active();
-        return self.handle orelse error.CursorClosed;
+        return handle;
     }
 };

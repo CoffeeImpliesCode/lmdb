@@ -4,6 +4,12 @@
 # retarget, so this one is written for this repository and names this
 # repository's gates.
 #
+# SPDX-License-Identifier: OLDAP-2.8
+#
+# This workflow is a fork-authored file, not upstream material. It matches the
+# primary upstream grant this package ships (`libraries/liblmdb/LICENSE`) and
+# nothing under `libraries/liblmdb/` carries it.
+#
 # Six jobs, six different questions:
 #
 #   licence      is the imported tree still the bytes upstream published: the
@@ -12,10 +18,15 @@
 #                them, and the one independent fixture - checked file by file
 #   native       does it build, does the installed header compile, link and run
 #                against the installed archive - the whole of it, core and
-#                dynamic-module loader alike - do the behavioural tests pass in
-#                both optimize modes, does the smoke program produce its
-#                output on this host, and does what the facade wrote read back
-#                byte for byte through upstream's own mdb_dump
+#                dynamic-module loader alike - is every installed artifact, tool,
+#                manual page and licence file where `zig build install` says it
+#                is, do the behavioural tests pass in both optimize modes, does
+#                the smoke program produce its output on this host, and does what
+#                the facade wrote read back byte for byte through upstream's own
+#                mdb_dump - and then the same repository again as the other of
+#                upstream's two forms, the shared library: its own soname and
+#                loader dependency, a C program linked against it and nothing
+#                else, and the installed tools run out of `bin/`
 #   matrix       does `zig build check` compile the C core, the facade, the tests,
 #                the smoke program and the interoperability program for every
 #                supported target, and does it re-derive that wasm32-wasi is
@@ -76,7 +87,7 @@ jobs:
         run: sha256sum -c UPSTREAM.sha256
 
   native:
-    name: native build, tests, smoke and interoperability
+    name: native build, tests, smoke, interoperability and both linkages
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -219,6 +230,54 @@ jobs:
             -o "$RUNNER_TEMP/c_surface"
           LMDB_GATE_DIR="$RUNNER_TEMP/lmdb-gate" "$RUNNER_TEMP/c_surface"
 
+      # Everything `zig build install` promises, named and checked. The library
+      # and the header are upstream's own install set (`ILIBS`, `IHDRS`,
+      # liblmdb/Makefile:49-51), the five tools and their manual pages are
+      # `IPROGS` and `IDOCS` (:52-53), `share/lmdb/LICENSE` and
+      # `share/lmdb/COPYRIGHT` are upstream's terms and notice, which upstream's
+      # own install rule (:65-78) does not copy and this one does, and the fork's
+      # own records travel in the same directory because they are under the same
+      # owner-authorized grant and their notices have to travel too.
+      - name: the installed archive, tools, manuals and terms
+        run: |
+          set -euo pipefail
+          test -f zig-out/lib/liblmdb.a
+          test -f zig-out/include/lmdb.h
+          test -f zig-out/lib/pkgconfig/lmdb.pc
+          for tool in mdb_stat mdb_copy mdb_dump mdb_load mdb_drop; do
+            test -x "zig-out/bin/$tool"
+            test -f "zig-out/share/man/man1/$tool.1"
+          done
+          for legal in LICENSE COPYRIGHT; do
+            test -f "zig-out/share/lmdb/$legal"
+          done
+          for record in NOTICE.md FORK-LICENSE.md UPSTREAM.md UPSTREAM.sha256 \
+                       README.md README.zig.md CHANGELOG.md FORK-NOTES.md; do
+            test -f "zig-out/share/lmdb/$record"
+          done
+          # midl.h stays internal: upstream installs one header, and a second
+          # one here would silently become the header a C consumer compiles
+          # against.
+          test ! -e zig-out/include/midl.h
+
+          # The generated link metadata has to describe the artifact it sits
+          # next to: `-llmdb` and nothing else for an ordinary query, and the
+          # crypto loader's library plus the threads flag under `--static`,
+          # which is where an archive consumer needs them (build.zig,
+          # `pkgConfigFile`). The version is this pin, where upstream's own rule
+          # hardcodes 1.0.0 for these 1.0.1 sources (liblmdb/Makefile:36).
+          export PKG_CONFIG_PATH="$PWD/zig-out/lib/pkgconfig"
+          pkg-config --validate lmdb
+          pkg-config --libs lmdb | tee "$RUNNER_TEMP/pc-ordinary"
+          if grep -qF -- '-ldl' "$RUNNER_TEMP/pc-ordinary"; then
+            echo 'an ordinary query carries the archive-only private libraries' >&2
+            exit 1
+          fi
+          pkg-config --static --libs lmdb | tee "$RUNNER_TEMP/pc-static"
+          grep -qF -- '-ldl' "$RUNNER_TEMP/pc-static"
+          grep -qF -- '-pthread' "$RUNNER_TEMP/pc-static"
+          grep -qF 'Version: 1.0.1' zig-out/lib/pkgconfig/lmdb.pc
+
       # Two optimize modes on purpose. Debug is where the C core is built with
       # the bounds and overflow checks on, and ReleaseSafe is the mode a
       # consumer of this package is most likely to ship. A binding that passes
@@ -240,6 +299,81 @@ jobs:
       - name: interoperability with upstream mdb_dump
         run: zig build interop
 
+      # The other of upstream's two delivery forms, from the same tree and the
+      # same tests, and it is in this job rather than in a second one so that
+      # one copy of the C program above is compiled and run against both
+      # artifacts and both closures are read out of the same checkout.
+      - name: shared library, installed closure and its own dependencies
+        run: |
+          set -euo pipefail
+          zig build -Dlinkage=dynamic
+
+          # The names are Zig's own for this name and version
+          # (`lib/std/zig.zig:156-241`), plus the two links `InstallArtifact`
+          # writes beside a versioned shared object on every non-Windows target
+          # (`lib/std/Build/Step/InstallArtifact.zig:99-105`).
+          test -f zig-out/lib/liblmdb.so.1.0.1
+          test -L zig-out/lib/liblmdb.so.1
+          test -L zig-out/lib/liblmdb.so
+
+          # The two facts the shared form has to get right by itself. The
+          # soname is the ABI series name upstream's own `-Wl,-soname` records
+          # (`SOVER = liblmdb.so.1`, liblmdb/Makefile:56-57). The loader
+          # dependency has to be recorded by the library, because `module.c`
+          # is inside it and calls dlopen (module.c:52-62): a consumer that
+          # linked the archive has to name `libdl` itself, and a consumer of
+          # this shared object must not have to.
+          readelf -d zig-out/lib/liblmdb.so.1.0.1 | tee "$RUNNER_TEMP/lmdb-dynamic"
+          grep -qF 'Library soname: [liblmdb.so.1]' "$RUNNER_TEMP/lmdb-dynamic"
+          grep -qE 'Shared library: \[libdl\.so' "$RUNNER_TEMP/lmdb-dynamic"
+
+          # And the shared variant's link metadata carries none of that.
+          export PKG_CONFIG_PATH="$PWD/zig-out/lib/pkgconfig"
+          pkg-config --validate lmdb
+          pkg-config --static --libs lmdb | tee "$RUNNER_TEMP/pc-shared-static"
+          if grep -qF -- '-ldl' "$RUNNER_TEMP/pc-shared-static"; then
+            echo 'the shared library re-declares the loader dependency' >&2
+            exit 1
+          fi
+
+      - name: the same program, and the installed tools, against the shared library
+        run: |
+          set -euo pipefail
+          # `-pthread` and `-ldl` are deliberately absent from this link line,
+          # unlike the archive one above: the shared object records both itself,
+          # and repeating them here would link state the loaded library already
+          # has. `$ORIGIN/../lib` is the same relative rpath the installed tools
+          # carry (build.zig, `installedRPath`), so this also exercises the
+          # installed layout's own loader path rather than a path to the cache.
+          # The same program, so its last line still says `liblmdb.a`: it is the
+          # same reader's logic linked the other way round, and the point of
+          # reusing it is that nothing about the program changes between the two
+          # link lines above except which library it is given.
+          zig cc -std=gnu17 \
+            -I zig-out/include \
+            "$RUNNER_TEMP/c_surface.c" \
+            -L zig-out/lib -llmdb \
+            -Wl,-rpath,'$ORIGIN/../lib' \
+            -o zig-out/bin/c_surface
+          LMDB_GATE_DIR="$RUNNER_TEMP/lmdb-gate" zig-out/bin/c_surface
+
+          # The installed tools, run against the environment that program wrote.
+          # `mdb_dump -p` prints every record in printable form
+          # (mdb_dump.c:146-148), so the value committed through the public
+          # header is the value the shipped reader finds - through the shared
+          # object the loader had to resolve for a program sitting in `bin/`.
+          zig-out/bin/mdb_dump -p "$RUNNER_TEMP/lmdb-gate/lmdb-c-surface" |
+            tee "$RUNNER_TEMP/lmdb-dump.txt"
+          grep -qF 'installed-lmdb' "$RUNNER_TEMP/lmdb-dump.txt"
+
+      - name: test, smoke and interoperability against the shared library
+        run: |
+          set -euo pipefail
+          zig build test -Dlinkage=dynamic
+          zig build test -Dlinkage=dynamic -Doptimize=ReleaseSafe
+          zig build smoke -Dlinkage=dynamic
+          zig build interop -Dlinkage=dynamic
+
   matrix:
     name: check the whole target matrix
     runs-on: ubuntu-latest
@@ -255,6 +389,12 @@ jobs:
       # that the sweep itself is complete.
       - name: compile everything for the matrix
         run: zig build check --summary all
+
+      # The same sweep for the other delivery form, because a shared object is
+      # a different link on every one of these targets and a matrix that only
+      # ever compiled the archive says nothing about it.
+      - name: compile everything for the matrix, shared linkage
+        run: zig build check -Dlinkage=dynamic --summary all
 
   cross:
     name: check ${{ matrix.target }}
@@ -345,6 +485,31 @@ jobs:
       # a module that builds from the inside and does not resolve from outside.
       # consumer/build.zig.zon names this package by relative path and its
       # build.zig asks for dep.module("lmdb") and nothing else.
+      #
+      # `LMDB_TEST_SCRATCH` is named here because the program refuses to invent
+      # one. consumer/src/main.zig:243-250 takes `--scratch <dir>` or
+      # `LMDB_TEST_SCRATCH` and nothing else; `TMPDIR` is never consulted, `/tmp`
+      # is never touched and nothing is written into the source tree, so a run
+      # with neither exits non-zero printing what it needs (:252-261). Exporting
+      # it here reaches the program by the same route as
+      # `zig build run -Dscratch=<dir>`, which passes it on as
+      # `--scratch <dir>` (consumer/build.zig:52-56, :92).
+      #
+      # `$RUNNER_TEMP` is this job's own directory inside the runner workspace:
+      # not `/tmp`, not the checkout, and holding nothing this gate did not put
+      # there. The program creates exactly one randomly named child inside it
+      # and removes that child and nothing else (consumer/src/main.zig:167-205),
+      # so the `mkdir -p` below states the location rather than working around a
+      # directory the program would not have created.
+      #
+      # This step carries no `continue-on-error` and no `|| true`. A
+      # disagreement, a refused provider load and a missing scratch location
+      # are all failures of this gate, and each one exits non-zero on its own.
       - name: run
         working-directory: consumer
-        run: zig build run
+        env:
+          LMDB_TEST_SCRATCH: ${{ runner.temp }}/lmdb-consumer-scratch
+        run: |
+          set -euo pipefail
+          mkdir -p "$LMDB_TEST_SCRATCH"
+          zig build run

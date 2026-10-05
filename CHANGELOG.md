@@ -45,6 +45,15 @@ and the observed lines so either can be repeated, and names them as what they
 are. Every other gate in §29's list is still `PENDING-VERIFICATION` over this
 tree.
 
+**Entry 31 is documentation and packaging, and it has no gate either.** It changed
+`NOTICE.md`, `FORK-LICENSE.md`, `README.md`, `README.zig.md`, `CHANGELOG.md` and
+`UPSTREAM.md`, and added `package.nix`, `flake.nix`, `devenv.nix`, `devenv.yaml`
+and `.envrc`. Not one byte under `libraries/liblmdb/` moved, so the 43 records in
+`UPSTREAM.sha256` still describe the bytes they described when last checked — an
+argument, not a receipt. No `zig build`, no `nix build`, no `devenv shell` and no
+`sha256sum -c` has run over that tree; the outstanding gates are listed gate by gate
+in `README.zig.md` and summarised in §31.
+
 ## 1. Added the Zig 0.16 package
 
 **Condition.** LMDB has no Zig package and none is inherited.
@@ -186,19 +195,19 @@ corrected wording has not been printed by a gate and is
 **Condition.** `lmdb.h` states each rule in English and the C follows none of
 them for you.
 
-**Fix.** `zig/root.zig` enforces each:
+**Historical fix, corrected by the Zig API alignment entry below.**
 
 | Upstream rule | What the facade does |
 |---|---|
-| `mdb_txn_commit` frees the handle on success (`mdb.c:4629-4637`) and aborts it on every failure | `commit` and `abort` both **clear the handle before calling the C**, so `defer txn.abort(); … try txn.commit();` is a no-op afterwards and a second `commit` is a no-op rather than a double free |
-| A read-only transaction never frees its cursors; they must be closed "before or after" the transaction ends (`lmdb.h:1620-1626`) | `Cursor.close` calls `mdb_cursor_close`, and is safe in either order |
+| `mdb_txn_commit` spends the handle on success and failure; the core may recycle the top-level write allocation (`mdb.c:3758`, `:4629-4637`) | `commit` and `abort` clear the handle before calling C, so deferred `abort` is a no-op after commit. The old claim that a second `commit` was also a no-op was wrong: it returns `error.TransactionClosed`. |
+| A read-only transaction never frees its cursors; they must be closed "before or after" the transaction ends (`lmdb.h:1620-1626`) | The old either-order facade promise was unsafe for the pinned native implementation. The current contract requires closing read cursors before commit, abort, or reset. |
 | A write transaction frees its own cursors — commit `mdb.c:4557`, abort `mdb.c:3737-3738`, nested merged into the parent `mdb.c:4439` | `Cursor.close` **does not** call `mdb_cursor_close` for a write cursor; the transaction owns that pointer |
-| `MDB_dbi` is an index, not a pointer (`lmdb.h:280-281`) | `Database` is a value with no `deinit`; `Environment.closeDatabase` is the only release |
+| `MDB_dbi` is an index, not a pointer (`lmdb.h:276-277`) | `Database` is a value with no `deinit`; `Environment.closeDatabase` is the only release |
 | `mdb_txn_reset` returns silently on the wrong kind of transaction (`mdb.c:3816-3826`) | `error.TransactionNotResettable` names the mistake instead |
 
-**Target bound.** The `Cursor.read_only` field is **captured at open**, not
-re-read at close, because a read-only cursor is allowed to outlive its
-transaction and `close` must still be safe when `owner` is out of scope.
+**Corrected target bound.** `Cursor.read_only` is captured at open rather than
+read through a possibly ended transaction. A read cursor must already be closed
+when its transaction ends. A closed wrapper can outlive that transaction.
 
 ## 8. Two status tables, not one, because a Windows build of `mdb.c` returns two numeric spaces
 
@@ -356,6 +365,15 @@ path; a host that names no root falls back to `.zig-cache/tmp`, which is what
 named from 12 random bytes in base64url (96 bits) and removes **only that
 directory**, on the normal path and on the one failure point after it was
 created.
+
+**Superseded for `consumer/src/main.zig`, on 2026-10-04.** Everything above is
+what entry 14 did to the tree as it then stood, and it stands. The consumer
+program has since been given a stricter rule: it reads `--scratch <dir>` or
+`LMDB_TEST_SCRATCH` and **nothing else** — `TMPDIR` is not consulted, `/tmp` is
+never touched, nothing is written into the source tree, and a run with neither
+exits non-zero naming what it needs (`consumer/src/main.zig:236-261`). The other
+three still take the temporary root as entry 14 describes. See
+"The consumer names its own scratch, and CI names it too — 2026-10-04" below.
 
 **Target bound.** `std.process.Environ.getAlloc` is used rather than
 `getPosix` because `Block` is `GlobalBlock` on Windows and `createMap` reads the
@@ -1089,8 +1107,9 @@ halves is in `FORK-NOTES.md` L19 and L20.
 
 **Condition.** Two of this package's steps exist only if they *execute*.
 `consumer` spawns a nested `zig build` inside `consumer/` and has to choose
-between `run` and `install` (`build.zig:828`); `interop` builds two programs and
-has to choose whether to compare their output (`build.zig:748`). Both chose with
+between `run` and `install` (the `hostCanExecute` call inside `runConsumer`);
+`interop` builds two programs and has to choose whether to compare their output
+(the `hostCanExecute` call inside `addInterop`). Both chose with
 one predicate, and the predicate they chose with could not answer the question
 they were asking.
 
@@ -1127,23 +1146,24 @@ names the operating system and the ABI, so on an x86_64 Linux host — where
 (`lib/std/zig/system.zig:48-51`, `:71-81`) — the one triple that describes the
 target this host can plainly execute was the one triple the gate skipped.
 
-**Fix.** One function, `hostCanExecute` (`build.zig:883-918`), now answers for
-both call sites, and it answers by asking the same question
-`std.Build.Step.Run` asks about the artifact it is about to spawn
+**Fix.** One function, `hostCanExecute` (`build.zig`, the `fn hostCanExecute`
+body), now answers for both call sites, and it answers by asking the same
+question `std.Build.Step.Run` asks about the artifact it is about to spawn
 (`lib/std/Build/Step/Run.zig:1268`): `std.zig.system.getExternalExecutor` with
 the two options `Run` fills in from the artifact, plus the executor switches the
-build runner resolved and `std.Build` exposes (`build.zig:886-893`). The
-returned executor is then mapped once: `.native, .rosetta => true` (`:895`),
-`.qemu => !candidate.isGnuLibC() or b.libc_runtimes_dir != null` (`:910`),
-`.wine, .wasmtime, .darling => true` (`:913`), `.bad_dl, .bad_os_or_cpu =>
-false` (`:916`). The two options are filled from this package's own facts, not
+build runner resolved and `std.Build` exposes. The returned executor is then
+mapped once, in that function's own `switch`: `.native, .rosetta => true`,
+`.qemu => !candidate.isGnuLibC() or b.libc_runtimes_dir != null`,
+`.wine, .wasmtime, .darling => true`, `.bad_dl, .bad_os_or_cpu => false`. Both
+options come from this package's own facts, not
 guessed: every executable this build runs links libc, so `.link_libc = true`;
 and QEMU reaches a foreign dynamic linker only when a libc-runtimes directory
 was supplied, so `.qemu_fixes_dl = candidate.isGnuLibC() and
 b.libc_runtimes_dir != null`. `runConsumer` forwards the switches this build
 resolved to the nested build — `-fdarling`, `-fqemu`, `-frosetta`, `-fwasmtime`,
-`-fwine` and `--libc-runtimes <dir>` (`build.zig:835-840`) — so the nested build
-executes under the same executor the decision was made with.
+`-fwine` and `--libc-runtimes <dir>`, spelled out in the `runConsumer` block that
+forwards the executor switches — so the nested build executes under the same
+executor the decision was made with.
 
 **The `.qemu` arm is a second gate, and it is why the QEMU half stays
 conservative.** `qemu_fixes_dl` cannot carry this decision: `getExternalExecutor`
@@ -1239,8 +1259,131 @@ with every other cell. Nothing here is evidence about any of them.
 whose gate decides between *running* and *installing* or *comparing* with a
 predicate of its own. The general form is in `FORK-NOTES.md` L21.
 
+## 31. The SDK became standalone: a canonical README, a real grant for its own files, and Nix/devenv packaging
+
+**Condition.** This package was a Zig package in a working copy. It had no
+`README.md` at all — its documentation was `README.zig.md` alone, which mixed the
+interface reference, the gate table, the licence record and the build instructions
+into one 906-line file. It had no licence statement of any kind on the files it
+wrote. It had no `package.nix`, no `flake.nix`, no `devenv.nix` and no
+`FORK-LICENSE.md`, so it could not be installed from Nix, could not be developed in
+a canonical shell, and could not answer "what licence covers the Zig code?" at
+all. And its `NOTICE.md` split upstream's 42 files into a list of 29 that restate
+the redistribution sentence and a list of 13 that do not, which is a good answer to
+one question and **no per-file record at all** for the question an auditor actually
+asks.
+
+**Symptom.** Three separate failures, none of them a build failure.
+
+1. *The licence record had no per-file answer.* A reader wanting to know what
+   governs `mdb_stat.c`, or `mdb_copy.1`, or `tooltag`, had to count two lists and
+   do the subtraction. The answer existed in the bytes of all 42 files; it was
+   simply not written down in one place.
+2. *The fork's own files were unlicensed.* `NOTICE.md` said so and called it
+   `PENDING-VERIFICATION` pending an owner decision — correctly, because it was the
+   owner's decision and not this fork's. Nothing else in the tree contradicted it.
+3. *The SDK was not standalone.* No Nix entry point, no development shell, and a
+   README that described an interface rather than a package.
+
+**Fix.** Six things, all fork-side, none touching a byte under `libraries/liblmdb/`.
+
+1. **`NOTICE.md` gained a complete per-file inventory of all 42 files.** One row
+   per file for 33 of them, plus two rows naming a group that shares one term
+   verbatim (`mtest.c` … `mtest6.c`, and `mtest_enc2/3/4.c`), so 35 rows over 42
+   files: the term that governs each, the line range **in that file** where the
+   term is written, what the build does with it, and whether an installed output
+   carries it. Each of the 29 that restate the redistribution sentence and each of
+   the 13 that do not appears exactly once, so the split and the table can be
+   checked against each other. Two rows fell out of reading every header rather
+   than grepping one sentence: `mdb_drop.c:3` carries the year range `2016-2021`,
+   which is neither `2011-2021` nor `2011-2026` and belongs to no other file; and
+   `mdb_dump.c` is compiled **twice** — once as the installed dump tool and once for
+   the `interop` oracle.
+
+2. **`module.c`'s loader dependency was recorded as link metadata, per variant**,
+   because that is where it actually bites. In the static variant `dlopen` is
+   unresolved by the archive and must reach the consumer's link line; in the shared
+   variant it is already a `DT_NEEDED` entry inside the shared object and
+   re-adding it would be wrong. Upstream's own template puts both on one `Libs:`
+   line (`Makefile:158`), which is correct for neither.
+3. **`FORK-LICENSE.md` was written and the grant answered.** The fork's own files
+   are released under **The OpenLDAP Public License, Version 2.8**,
+   `SPDX-License-Identifier: OLDAP-2.8`, on the repository owner's authorization
+   for this migration wave, matching the project's primary upstream term. A
+   generic MIT was considered and rejected and is asserted nowhere in this tree.
+   Two clauses of that licence text constrain the fork specifically and are
+   recorded rather than assumed away: the warranty paragraph names the OpenLDAP
+   Foundation, who authored none of these files, and the licence is a grant of
+   permission that transfers no title. **No personal copyright identity is
+   invented anywhere.**
+4. **`README.md` was written, in the required order** — current native-source
+   deviations, current native-build deviations with a dated history link, the
+   current build/run/test matrix, then consumption — and `README.zig.md` was kept as
+   the separate Zig interface document.
+5. **`README.upstream.md` was deliberately not created.** Upstream's tree at
+   `6f0a32496a5aadee15a5e5103c479bd3355ae273` has no README at any depth; the
+   driver's byte-verified proof records `"primary_readme": null` for this project.
+   Upstream's prose is `libraries/liblmdb/intro.doc` and
+   `libraries/liblmdb/upgrading.doc`, which stay at those original paths,
+   unmodified. The rule recorded in `UPSTREAM.md` is the general one: a
+   fork-authored `README.md` must never be described as an upstream file, because
+   there is nothing at the pin for it to be a copy of.
+6. **`package.nix`, `flake.nix`, `devenv.nix`, `devenv.yaml` and `.envrc` were
+   written.** One uncurried derivation over this directory, injected
+   `{ lib, stdenv, zig, linkage ? "static" }`, returning one output; the variants
+   live in the entry points as `packages.<system>.static` / `.shared` /
+   `.default` and as lazy `outputs.static` / `outputs.shared` in the devenv shell.
+   Pinned nixpkgs, no `../workspace` import, no sibling dependency, no host path,
+   no build-time download, and no Nix cross-compilation. The derivation installs
+   nothing of its own: `build.zig` owns every installed path. devenv is the
+   canonical environment, publishes tools only, and carries namespaced `lmdb:*`
+   tasks; the flake deliberately publishes no `devShells`, because a dev
+   shell that must build the SDK to be entered is not a fast loop. Neither lock file
+   was invented by entry 31; both were the driver's to create from the two pinned
+   inputs. **Superseded on one point on 2026-10-04:** `flake.lock` is now in the
+   tree, recording the same commit `flake.nix` names
+   (`c7def046b9a883d46974757852106483d741586f`) with its `narHash`, so the flake
+   input is resolved rather than floating. `devenv.lock` is still absent and was
+   not invented. See
+   "`flake.lock` arrived, and the documents that said no lock existed — 2026-10-04"
+   below.
+
+**Targets bound.** Zig 0.16.0 for everything in this entry. The Nix surface is bound
+to nixpkgs commit `c7def046b9a883d46974757852106483d741586f`, at which
+`pkgs/top-level/all-packages.nix:6745` defines `zig_0_16 = zigPackages."0.16"` and
+`pkgs/development/compilers/zig/default.nix` derives that name from
+`majorMinor "0.16.0"`, and `lib/licenses/licenses.nix:1318-1321` defines
+`lib.licenses.openldap` with `spdxId = "OLDAP-2.8"` — the same identifier this entry
+records. The devenv shell is bound to
+`github:cachix/devenv-nixpkgs/c2f38fe7f9e04d9aadd354d380f2bd40531d9737`.
+
+**Not verified by this entry, and not claimed.** No gate has run over this wave's
+tree. Specifically outstanding, each as a row in the gate table in
+`README.zig.md`: the shared native variant's install layout and the soname read out
+of a real artifact; both Nix derivations and their installed closures; the devenv
+shell; a C consumer resolving `-ldl` through `Libs.private` in the static variant and
+not needing it in the shared one; and `sha256sum -c UPSTREAM.sha256` over this tree.
+**Nothing under `libraries/liblmdb/` moved and no digest was rewritten**, so the 43
+records still describe the bytes they described when last checked — which is an
+argument, not a receipt, and is why the integrity row stays open.
+
 ## What is deliberately still open
 
+* **Nothing this migration wave added has been built or run.** Entry 31's shared
+  native variant, its generated `lmdb.pc`, its four extra tools, its man pages,
+  `share/lmdb/{LICENSE,COPYRIGHT}` in the install prefix, both Nix derivations, the
+  devenv shell and `FORK-LICENSE.md`'s install table are all
+  `PENDING-VERIFICATION`. Two of them carry a specific unverified claim that is
+  worth naming because it is the kind of thing that reads as observed: the shared
+  library's **soname** is stated as `liblmdb.so.1`, read out of Zig's naming rules
+  and upstream's `SOVER`, and **no artifact has been read**. A gate that does
+  `readelf -d` on the installed library is what would settle it.
+* **One platform gap in the packaging is stated rather than fixed.** `patchelf`
+  rewrites ELF rpaths and does not read Mach-O, so the build-cache rpath Zig adds
+  to each installed tool is stripped on ELF and left in place on Darwin, where the
+  `@loader_path/../lib` entry is added separately so the tool still resolves the
+  installed library. Closing it properly needs Mach-O rpath surgery this fork has
+  not run and will not claim.
 * **`zig build -fsys=lmdb` has not been run**, and no result is claimed for it. It
   needs an installed liblmdb with a matching header, and no such installation was
   used here. The installed-artifact receipts are this package's **own** `zig-out/`
@@ -1313,18 +1456,576 @@ predicate of its own. The general form is in `FORK-NOTES.md` L21.
   packaging receipts of entry 26 do not narrow this: `zig fetch` was given a local
   directory, so **registry resolution and `.url`/tarball dependency resolution
   remain untested** and no hash for either form exists.
-* **The README's `.url` snippet is still a placeholder**, and stays one until a
-  release is published and fetched by somebody. What entry 26 establishes is the
+* **Both READMEs' `.url` snippets are placeholders**, and stay ones until a
+  release is published and fetched by somebody. `README.zig.md` §"As a
+  dependency" and `README.md` §"Consumption" both write `<owner>` and
+  `<this repository>` where the real URL belongs; neither is an invented
+  identifier, and no hash is invented with it. What entry 26 establishes is the
   `.path` form, in this tree and in a copy made from `.paths`.
 
 ## See also
 
 * [`UPSTREAM.md`](UPSTREAM.md) — the pin, and what the integrity record does and
   does not establish.
+* [`README.md`](README.md) — this fork's README: current native-source
+  deviations, current native-build deviations with their dated history, the
+  build/run/test matrix, and consumption. Fork-authored in full; upstream ships
+  no README at this pin, so there is no `README.upstream.md`.
+* [`FORK-LICENSE.md`](FORK-LICENSE.md) — the grant for every file this fork
+  writes, its authority, its SPDX identifier, and what it does not cover.
 * [`NOTICE.md`](NOTICE.md) — the per-path legal record: licence scope, the
-  OLDAP-2.8 obligations, the other terms the tree retains, and every file this
-  fork adds.
+  OLDAP-2.8 obligations, the complete per-file inventory of all 42 upstream files,
+  the other terms the tree retains, and every file this fork adds.
 * [`README.zig.md`](README.zig.md) — how to build, import and call the package,
   with the full operation, lifetime, error, flag and bounds tables and the exact
   gate commands.
 * [`FORK-NOTES.md`](FORK-NOTES.md) — the reasoning behind each entry above.
+
+## Zig API contract alignment — 2026-10-03
+
+**Condition.** The pinned `mdb_cursor_close` reads its transaction during
+read-cursor cleanup. The old either-order facade promise permitted a
+use-after-free. A write cursor has a different native owner.
+
+**Fix.** Require read-cursor close before commit, abort or reset. Migrate
+the fixture and consumer cleanup; close the writer environment before reopening
+it. Reject closed cursor traversal before reading its former owner. Keep write
+cursors transaction-owned, without a registry or a skipped read-cursor free.
+Document stable wrapper addresses, alias copies, success-with-null status,
+the second-commit error versus repeated-abort no-op, and actual build routes.
+The historical ownership table above now records its corrected contract.
+
+**Verification and bound.** Zig 0.16.0, native Linux x86-64: install,
+Debug/ReleaseSafe/ReleaseFast/ReleaseSmall tests, smoke and package consumer
+pass. A separate consumer passes in all four modes: read close before each
+teardown/reset, renewal, writer close before/after commit/abort, nested cursor
+ownership, and a closed cursor after its parent and environment leave scope.
+The documented `readFirst` helper runs against a seeded database. Compile-only
+`check` passes its supported rows; WASI remains an explicit refusal, not a pass.
+No C, header or generated binding changed. Incorrect parent order remains an
+unchecked caller precondition, not a newly implemented runtime error.
+
+## Behavioural corrections to three tests — 2026-10-04
+
+**Condition.** Three tests in `tests.zig` asserted something the pinned core does
+not do, and the first of them was wrong about the facade rather than about the
+C. Each was read out of the pinned sources; none was re-run here.
+
+**Fix.** In three parts.
+
+* `mdb_env_get_maxkeysize` is the one LMDB call in the surface that answers with
+  a value rather than a status — lmdb.h:1061 documents its return as "The
+  maximum size of a key we can write" — and `mdb_env_get_maxkeysize` is
+  `return ENV_MAXKEY(env)` (mdb.c:12678-12682) over the `me_maxkey` that
+  `mdb_env_open2` computes at mdb.c:5657-5659. `Environment.maxKeySize` ran that
+  value through `check`, so every real answer — every one of them far above zero
+  — came back as `positiveStatus`, and "the key size limit is exactly the
+  boundary upstream draws" could not read the limit at all. The accessor no
+  longer applies `check`. The test's boundary value was right: `mdb_cursor_put`
+  refuses at `key->mv_size-1 >= ENV_MAXKEY(env)` (mdb.c:8605-8606), so exactly
+  `limit` is accepted and `limit + 1` is turned away.
+
+* A database opened without `MDB_DUPSORT` is given a *null* `md_dcmp`
+  (mdb.c:12258-12259) and `mdb_dcmp` calls that pointer with no check
+  (mdb.c:2222-2225). lmdb.h:1821 states the precondition. The test was asking a
+  database without duplicates for its default duplicate comparison, which is a
+  call through address zero; it now asks a `dupsort` handle for that default,
+  and shows the database without duplicates answering only once `mdb_set_dupsort`
+  has given it a comparator — upstream stores one whatever the flags were
+  (mdb.c:12651-12658). The `compareValues` and `setValueComparator` doc comments
+  claimed the opposite and are corrected. No check was added: upstream has no
+  status to refuse the call with, and the flag is the whole of the protection.
+
+* `mdb_cursor_next` sets `C_EOF` and returns `MDB_NOTFOUND` past the last record
+  while leaving `C_INITIALIZED` and the record index alone (mdb.c:7912-7917), and
+  `mdb_cursor_is_db` asks about `C_INITIALIZED`, never about `C_EOF`
+  (mdb.c:9816-9826). An end-of-walk cursor is therefore still on the record it
+  last reached. The walk test asserted the opposite; it now asserts that the
+  cursor is still on the catalogue entry and that `MDB_GET_CURRENT` reads that
+  record back (mdb.c:8340-8366). Only a never-positioned cursor answers "no
+  record", because `mdb_cursor_init` leaves `mc_snum` at zero and clears
+  `C_INITIALIZED` (mdb.c:9673-9678). The `onNamedDatabase` doc comment claimed
+  the end-of-walk case and is corrected.
+
+**Verification and bound.** `PENDING-VERIFICATION`: no build, test, lint or
+format ran over this change. Every cause above is read out of the pinned
+`libraries/liblmdb/mdb.c` and `lmdb.h` (pin `6f0a32496a5aadee15a5e5103c479bd3355ae273`).
+Zig files changed: `zig/root.zig`, `tests.zig`. No C, header, upstream byte, build
+graph or generated binding changed. `compareValues` on a database opened without
+`dupsort` still reaches upstream's null call — documented now as the thing
+lmdb.h:1821 forbids, rather than exercised.
+
+## The consumer names its own scratch, and CI names it too — 2026-10-04
+
+**Condition.** `consumer/src/main.zig` takes the directory its scratch database
+goes in from `--scratch <dir>` or from `LMDB_TEST_SCRATCH`, and from nothing
+else. `TMPDIR` is not consulted, `/tmp` is never touched, nothing is written
+into the source tree, and a run with neither exits non-zero after printing what
+it is missing (`consumer/src/main.zig:236-261`). Under `-Druntime` the provider
+works the same way: `--provider <path>` or `LMDB_TEST_PROVIDER`, no default, no
+search, no fallback to a linked copy (`:210-234`).
+
+**Symptom, one — CI could not pass as written.** The `consumer` job in
+`.github/workflows/verify.yml` ran `zig build run` in `consumer/` and named
+neither value. `consumer/build.zig:52-56` declares `-Dscratch` with no default
+and only adds the argument when it is given (`:92`), so the program received no
+database location and exited non-zero. Every run of that job would have failed,
+and for a reason that has nothing to do with what the job exists to prove.
+
+**Symptom, two — the documents denied a capability the code has.**
+`README.zig.md` and `README.md` both stated that the shared-variant consumer was
+unavailable because `consumer/build.zig` declares no `-Dlinkage`. It does:
+`consumer/build.zig:30-39` declares `-Dlinkage` and `-Druntime` and passes both
+into `b.dependency("lmdb", …)`, and `build.zig:1317-1318` forwards both into the
+nested build **unconditionally**. The claim was wrong when written against an
+older `consumer/build.zig`, and it was never checked against the current one.
+
+**Symptom, three — the two options were undocumented.** `-Dscratch`,
+`-Dprovider`, `LMDB_TEST_SCRATCH` and `LMDB_TEST_PROVIDER` appeared nowhere in
+`README.md`, `README.zig.md`, `FORK-NOTES.md` or this file, although
+`build.zig:1733-1742` and `consumer/build.zig:52-61` declare them and both
+documented consumer commands were therefore not reproducible.
+
+**Fix.** Three parts.
+
+* `.github/workflows/verify.yml`'s `consumer` job exports
+  `LMDB_TEST_SCRATCH: ${{ runner.temp }}/lmdb-consumer-scratch` and creates that
+  directory before running. `runner.temp` is the job's own directory inside the
+  runner workspace: not `/tmp`, not the checkout, and holding nothing this gate
+  did not put there. The program makes exactly one randomly named child inside
+  it and removes that child and nothing else
+  (`consumer/src/main.zig:167-205`), so the `mkdir -p` states the location
+  rather than substituting for the program's own bookkeeping. The step carries
+  no `continue-on-error` and no `|| true`, so a disagreement, a refused provider
+  load and a missing scratch location each still fail the job.
+* The false boundary is deleted and replaced with the three real commands —
+  `zig build consumer -Dscratch=<dir>`, the same with `-Dlinkage=dynamic`, and
+  the same with `-Druntime=true -Dprovider=<path>` — plus the equivalent
+  `cd consumer && zig build run …` forms, in a new
+  `README.zig.md` §The consumer package. It states that a provider path must be
+  absolute, because `runtime/loader.zig:185-196` returns `error.InvalidSource`
+  for a relative `.path` rather than searching for it.
+* The three historical consumer receipts keep their observations and their
+  commands, each now carrying the caveat that its tree's consumer took its
+  location implicitly. A historical observation is not rewritten into a claim
+  about a later tree, and the pending row below records that none of the three
+  shapes has been run on this one.
+
+**A load failure stays a failure.** `consumer/src/main.zig:289-291` calls
+`lmdb.load(.{ .path = … })` before anything else and propagates the error, so a
+provider that cannot be opened, a missing `mdb_*` symbol and a second `load`
+with a different request each stop the run non-zero. Nothing in this change adds
+`continue-on-error`, `|| true`, a `set +e`, a default provider or a default
+scratch location anywhere.
+
+**Target bound.** Zig 0.16.0's `std.Build` option forwarding and
+`std.process.Environ`; any consumer program that refuses to invent a location
+for itself, and any CI job that runs one.
+
+**Verification and bound.** `PENDING-VERIFICATION`. No build, test, CI run,
+lint or format was executed over this change by the author of it; every claim
+above is read out of the current sources cited. The workflow has still never
+met a runner, and the three consumer shapes have never been run on this tree.
+Files changed: `.github/workflows/verify.yml`, `devenv.nix`, `README.md`,
+`README.zig.md`, `FORK-NOTES.md`, this file. No C source, header, upstream byte,
+build graph, consumer source or generated binding changed.
+
+**The `devenv` task was the same defect in a second caller.** `devenv.nix`'s
+`lmdb:consumer` ran a bare `zig build consumer`, so it hit the same refusal as
+the CI job. It now names the location itself: a value the caller exported as
+`LMDB_TEST_SCRATCH` always wins, and otherwise the task makes a fresh
+`mktemp -d` **inside the `TMPDIR` the caller exported** — never `/tmp`, never
+the checkout, never a default this file invented — and prints the path. With
+neither `LMDB_TEST_SCRATCH` nor `TMPDIR` exported it exits non-zero naming what
+is missing rather than guessing. Nothing is swept afterwards: the consumer
+program deletes only the one random child it created
+(`consumer/src/main.zig:167-205`), and the task adds no cleanup of its own. No
+provider is named there, because this is the linked build; a runtime-loaded
+consumer still needs `LMDB_TEST_PROVIDER` or `-Dprovider=<absolute path>` from
+its caller, with no fallback.
+
+## `flake.lock` arrived, and the documents that said no lock existed — 2026-10-04
+
+**Condition.** Entry 31 recorded that neither Nix lock file was in the tree and
+that this fork does not invent one, because a lock records a resolution the fork
+had not performed.
+
+**Symptom.** `flake.lock` is now in the tree. It records nixpkgs at
+`c7def046b9a883d46974757852106483d741586f` — the very commit `flake.nix:11`
+names, not a branch — with its `narHash` and `lastModified`, in the schema
+version `nix` itself wrote. `README.md`, `README.zig.md` and `FORK-NOTES.md`
+each still said that no lock file was present, which had become false. The
+in-tree text is a fact about this repository, so it was re-read and corrected
+rather than left as an argument from an earlier tree.
+
+**Fix.** State what is in the tree and what is not, separately, because they are
+different files answering different questions: `flake.lock` is present and
+pins exactly the commit `flake.nix` names, so `nix build` resolves the pin;
+`devenv.lock` is **still absent** and was **not** invented, so the devenv input
+is still the driver's to resolve. Entry 31's sentence is annotated as superseded
+on that one point rather than rewritten.
+
+**Not claimed.** Nothing here is a Nix observation. No `nix build`,
+`nix flake lock`, `nix develop` or `devenv shell` ran over this tree, so the
+derivations remain `PENDING-VERIFICATION` exactly as the gate table records
+them. A lock file in the tree says the flake resolves that input; it does not
+say any derivation evaluates or builds.
+
+**Verification and bound.** `PENDING-VERIFICATION`, and the observation behind
+it is a reading of files rather than a command's output: `flake.lock` in the
+tree, and `flake.nix:11`, whose `nixpkgs` rev they agree on. No `nix` command of
+any kind was run.
+
+**What this entry closed, not just reported.** Three things outside the
+document set were corrected in the same pass, because leaving them would have
+left the record contradicting itself:
+
+* `build.zig.zon`'s `.paths` now names `flake.lock`, beside the `flake.nix` it
+  resolves, so a package materialised through `.paths` carries the resolution
+  with the pin. `devenv.lock` is deliberately **not** listed and still does not
+  exist: naming an absent file would break the fetch rather than resolve
+  anything. `.paths` goes from 24 entries to 25, so per §26 above any recorded
+  `zig fetch` identity for this package is stale and is re-derived once from the
+  frozen tree, not per edit.
+* `flake.nix`'s header said "No lock file: the driver creates it from the one
+  input below", which the presence of `flake.lock` had made false. It now says
+  what is beside the file and what is not.
+* `devenv.nix`'s `lmdb:consumer` task ran a bare `zig build consumer`, which the
+  consumer program's own rule makes non-zero: it names the value now. See the
+  consumer entry above.
+
+Files changed across this entry: `README.md`, `README.zig.md`, `FORK-NOTES.md`,
+`build.zig.zon`, `flake.nix`, `devenv.nix`, this file. `flake.lock` itself,
+`devenv.yaml` and `.envrc` were not touched.
+
+## `devenv.stateDir` was never an attribute, and four gates died on it — 2026-10-04
+
+**Condition.** `devenv.nix` took the module argument `devenv` and interpolated
+`${devenv.stateDir}` into `enterShell`, to name a default directory for the two
+Zig caches for a caller who had exported none.
+
+**Symptom, OBSERVED.** The acceptance run `20261004T172416Z` passed `nix:build`,
+`devenv:info`, `devenv:tasks-list` and `repo:untouched`, and every gate that forces
+the shell derivation failed while *evaluating this file*:
+
+```text
+   at /vol/fob-vol7/mi19/gertullj/foundation-libs/lmdb/devenv.nix:138:37:
+    137|     if [ -z "''${ZIG_LOCAL_CACHE_DIR:-}" ]; then
+    138|       export ZIG_LOCAL_CACHE_DIR="${devenv.stateDir}/zig/local"
+       |                                     ^
+    error: attribute 'stateDir' missing
+```
+
+`gates_failed` names the four: `devenv:shell-zig-version`, `devenv:shell-zig-env`,
+`devenv:integrity`. Receipt: the index
+`/home/tmp2/gertullj/scratch/foundation-libs/contract-physics-lua/nix-acceptance-evidence/20261004T172416Z/lmdb-index.json`
+beside it, log `lmdb-devenv-shell-zig-version.log`. The same run is why the tree
+looked evaluable at all: `devenv info` and `devenv tasks list` never force
+`config.shell`, and `config.enterShell` is interpolated only where
+`top-level.nix:474` assembles `shellHook`.
+
+**Why `devenv` was the wrong namespace — SOURCE-CONFIRMED, not inferred.**
+devenv hands the resolved flake **inputs** to every module. The bootstrap library
+that run generated into its own scratch project
+(`…/sdks/lmdb/project/.devenv/bootstrap/bootstrapLib.nix`) evaluates with
+`specialArgs = inputs // { inherit inputs secretspec primops; }`, and the
+`devenv.lock` written into that same scratch names a `devenv` node,
+`github:cachix/devenv/fe20b5cba7ab5e93ae73f956a8d3efc50e1753f4?dir=src/modules`.
+So `{ pkgs, devenv, ... }` bound `devenv` to that **input** — a path and its
+metadata — which has no `stateDir`. The state directory is the *option*
+`devenv.state`: declared at `src/modules/top-level.nix:272`, defaulted at `:383` to
+`<dotfile>/state`, exported to the shell as `DEVENV_STATE` at `:388`, and set by
+the caller in `bootstrapLib.nix`. devenv's own `services/kafka.nix:6` derives a
+state directory from `config.devenv.state`.
+
+**Fix, bounded to the shell entry and the two lines that named the wrong
+namespace.** `enterShell` interpolates nothing now. A `ZIG_GLOBAL_CACHE_DIR` or
+`ZIG_LOCAL_CACHE_DIR` the caller exported is left exactly as it is; otherwise the
+root is `$XDG_CACHE_HOME`, else `$TMPDIR`, else the shell says on stderr that it
+chose no location. Only the two directories it chose itself are created, so
+nothing is written into the checkout or onto a filesystem the caller did not
+name. The `devenv` module argument is dropped from the header, because those two
+lines were its only use. `config.devenv.state` was deliberately **not** taken as
+the default root: it is `<devenv root>/.devenv/state`, and the devenv root is
+this checkout whenever the shell is entered in it, so a Zig cache there is a
+cache in the source tree.
+
+**Not claimed.** No `nix`, `devenv` or `zig` command was run for this entry. The
+correction is a reading of the run's own generated bootstrap library, of the
+pinned devenv module and CLI sources at `fe20b5cb…`, and of the four gate logs.
+It does not claim that any gate is green: the four that failed are still red until
+the driver replays them, and `nix:build` — the one Nix gate that passed in that
+run — was not re-run to confirm anything.
+
+**Verification and bound.** `PENDING-VERIFICATION` as behaviour,
+`SOURCE-CONFIRMED` as text. The bound is the four shell-dependent gates
+(`devenv:shell-zig-version`, `devenv:shell-zig-env`, `devenv:consumer`,
+`devenv:integrity`) and nothing else: no gate in this package that does not force
+the shell can distinguish this change from the tree it replaced. The shell body
+was parsed for shell syntax only; that is not a devenv evaluation and is not
+offered as one.
+
+**What this entry closed, not just reported.** The banner said `devenv task
+lmdb:build`. The pinned CLI declares `Commands::Tasks { command: TasksCommand }`
+with `Run` and `List` beneath it and no alias, and the driver invoked `devenv
+tasks run … lmdb:consumer` and `devenv tasks list --json`, so the banner now says
+`devenv tasks run`. That is what `FORK-NOTES.md`'s row "the devenv task runner's
+spelling" was waiting for; the row is closed as far as reading closes it, and no
+`exec` body has run yet.
+
+Files changed across this entry: `devenv.nix`, `FORK-NOTES.md`, this file.
+`package.nix`, `flake.nix`, `flake.lock`, `devenv.yaml` and everything under
+`libraries/liblmdb/` were not touched, so `UPSTREAM.sha256` still describes the
+same 43 records.
+
+## A task body inherited the caller's directory, and both driver gates named files in it — 2026-10-04
+
+**Condition.** `devenv.nix`'s ten task bodies said `zig build …`,
+`LMDB_TEST_SCRATCH="$scratch" zig build consumer` and
+`sha256sum -c UPSTREAM.sha256`, and said nothing about where they ran. A devenv
+task is materialised as a generated shell program that inherits the working
+directory of whoever ran it, and `$DEVENV_ROOT` names that same caller
+directory. The consumer body's scratch rule was already careful about a
+database location and blind to the build graph beside it.
+
+**Symptom, OBSERVED.** Acceptance run `20261004T193710Z`, both canonical routes
+run as `devenv tasks run --mode single --no-impure --no-reload --no-tui
+--max-jobs 2 --cores 8 --from path:<this SDK> lmdb:<name>`, with the scratch
+project directory `…/sdks/lmdb/project` as the working directory. Both red,
+both reporting the scripts' own absence rather than anything about LMDB:
+
+```text
+  • Running lmdb:consumer
+  lmdb:consumer: scratch /home/tmp2/gertullj/tmp/lmdb-consumer.J6FIdJWv
+  info: initialize build.zig template file with 'zig init'
+  info: see 'zig --help' for more options
+  error: no build.zig file found, in the current directory or any parent directories
+✖ Running lmdb:consumer in 260ms (failed)
+```
+
+```text
+  • Running lmdb:integrity
+  sha256sum: UPSTREAM.sha256: No such file or directory
+✖ Running lmdb:integrity in 457ms (failed)
+```
+
+Receipts: the index
+`/home/tmp2/gertullj/scratch/foundation-libs/contract-physics-lua/nix-acceptance-evidence/20261004T193710Z/lmdb-index.json`,
+with `lmdb-devenv-consumer.log` and `lmdb-devenv-integrity.log` beside it. Both
+lines above are quoted out of those two logs; the scratch directory they ran in
+holds none of `build.zig`, `UPSTREAM.sha256` or `consumer/`, which is what the
+messages say.
+
+**Fix, in `devenv.nix` only.**
+
+* One `let` binding, `sdkRootArg = pkgs.lib.escapeShellArg (builtins.toString
+  ./.)`, and one line from it, `inSdk = ''cd ${sdkRootArg} || exit 1'',` open
+  **all ten** bodies, `lmdb:integrity` included, because that is the one that
+  names `UPSTREAM.sha256`. `builtins.toString`, not `${./.}`: interpolating the
+  path copies this whole SDK into the read-only store, and the tasks would then
+  build a frozen copy instead of the tree `UPSTREAM.sha256` describes. `|| exit
+  1`, because an unchecked `cd` leaves the task in the directory it exists to
+  escape.
+* A second binding, `zigCache`, applies at task time the rule `enterShell`
+  already applied: a `ZIG_GLOBAL_CACHE_DIR` or `ZIG_LOCAL_CACHE_DIR` the caller
+  exported wins and is never overwritten, otherwise the root is
+  `$XDG_CACHE_HOME`, else `$TMPDIR`, else the task names what is missing on
+  stderr and exits non-zero. Same two variable names, same order, same two
+  directory names as the hook, so the two cannot drift — and a task does not
+  depend on the hook having run, because `devenv tasks run` is its own route.
+  `/tmp` and this checkout are not fallbacks for anything. Its last three lines
+  run on **every** task, not only when a variable was missing: they create and
+  announce `$ZIG_LOCAL_CACHE_DIR/lmdb/build`, the cache every `zig build` in this
+  file names, and they run before the compiler does.
+* A third binding, `installPrefix`, gives `lmdb:build` and `lmdb:build-dynamic`
+  a prefix under the caller's own local cache, `$ZIG_LOCAL_CACHE_DIR/lmdb/static`
+  and `…/lmdb/dynamic`, one per linkage. A bare `zig build` installs — the
+  archive, the translated header, the generated `lmdb.pc`, the five tools, the
+  five man pages and the two upstream records (the `b.installArtifact`,
+  `installHeader`, `addInstallFile` and `b.installFile` calls in `build.zig`) —
+  and its own default prefix is `zig-out` inside this checkout, on a shared
+  volume and inside the tree whose file set the driver digests before and after
+  a run. The seven non-installing steps carry no prefix, because they install
+  nothing:
+  `test`, `test-release-safe`, `smoke`, `check`, `check-refused-target`,
+  `interop` and `consumer`.
+* A fourth binding, `zigFlags`, is the one string every `zig build` carries:
+  `--cache-dir "$lmdb_build_cache" -j8 --summary all`, placed after the step and
+  the options a task owns. No body spells those flags itself, so no two bodies
+  can disagree about them. The explicit `--cache-dir` is the load-bearing half:
+  without it Zig resolves `.zig-cache` from the working directory, which is this
+  checkout. No task forwards `"$@"`, and none did before this entry, so there is
+  no argument here for a caller flag to override; `devenv tasks run` takes task
+  names only, which is why the flags live in the body.
+
+**Not claimed.** No `nix`, `devenv`, `zig` or `cross-test` command was run for
+this entry; it is a reading of `devenv.nix`, of the two logs quoted above and of
+`build.zig`. The two gates are **not** claimed green: they were red in that run
+and the driver replays them after this freeze. Nothing under
+`libraries/liblmdb/`, `build.zig`, `build.zig.zon`, `package.nix`, `flake.nix`,
+`flake.lock`, `devenv.yaml`, `consumer/`, `testdata/` or `.github/` changed, so
+`UPSTREAM.sha256` still describes the same 43 records and the 53 compiled inputs
+still carry the stamps they carried.
+
+Files changed across this entry: `devenv.nix`, `README.md`, `README.zig.md`,
+`FORK-NOTES.md`, this file.
+
+## The smoke now enters its map-borrowing observation — 2026-10-04
+
+**Condition and symptom, SOURCE-CONFIRMED.** `smoke.zig` defined
+`borrowFromTheMap` but `main` did not call it. The final agreement message
+therefore did not include the helper's observations of stored bytes, lifetime
+across an unrelated `Transaction.get`, or repeated reads at the same map address.
+
+**Fix.** `main` calls the existing helper after `readBackAndWalk`, while the
+records written by `writeAndCommit` are available. The helper and native
+implementation are unchanged.
+
+**Target bound and status.** Linked and runtime-loaded smoke routes that can
+open the real LMDB environment. `OBSERVED` on the linked `Debug` static route:
+`zig build smoke --cache-dir …/cache/smoke --prefix …/smoke-prefix -j8
+--global-cache-dir /home/tmp2/gertullj/cache/zig --summary all -Doptimize=Debug
+-Dlinkage=static -Druntime=false` exited 0 with `Build Summary: 7/7 steps
+succeeded`, `smoke success` and `+- run exe lmdb-smoke success 19ms`, and the
+program printed `borrowed 5 bytes at 0x7f080ee02fe6 survive an unrelated read`
+before its closing `all observations agreed`. The receipt
+`parent-map-smoke.json` sits in
+`/home/tmp2/gertullj/scratch/foundation-libs/text-contract-probes/lmdb/epochs/after/reader-callback-status-after/`
+and is classified `MAP_SMOKE_PASS`. The runtime-loaded route and every other
+mode stay `PENDING-VERIFICATION`. The existing foreign robust-lock `ENOSYS`
+boundary is unchanged.
+
+## The nested consumer inherits the outer build's resolved choices — 2026-10-04
+
+**Condition and symptom, SOURCE-CONFIRMED.** The SDK's nested `zig build`
+consumer omitted CPU, resolved system-library selection, global cache, job
+width, summary mode, the caller's install prefix and caller arguments after
+`--`. Its graph could therefore resolve choices different from the graph the
+caller requested, and a caller who named a `--prefix` saw the nested build
+install into `consumer/zig-out` instead.
+
+**Fix.** One helper, `runConsumer`, now carries the resolved graph into the
+nested build. It serializes the target query's CPU as `-Dcpu`, forwards either
+`-fsys=lmdb` or `-fno-sys=lmdb`, and keeps the query triple, optimization,
+linkage, runtime, the optional `-Dscratch`/`-Dprovider` values and the executor
+switches. It names the local cache as `--cache-dir` with `/consumer` appended to
+`b.cache_root.path`, guarded on that path being set, and passes the inherited
+global cache whole as two-token `--global-cache-dir` carrying
+`b.graph.global_cache_root.path`; a null there stops the build instead of
+inventing a cache. It adds `-j8` and two-token `--summary all`. It relays this
+invocation's own `b.install_prefix` as `--prefix`, made absolute first so it does
+not resolve against `consumer/`, and only when that prefix is not the default
+`<build root>/zig-out`. `b.args` goes on last behind `--`, and
+`consumer/build.zig` hands its own `b.args` to `run_exe`, so a caller's argument
+reaches the program through both hops. The subcommand is still `run` or
+`install`, chosen by `hostCanExecute` and placed before the options.
+
+**Target bound and status.** All nested LMDB consumer configurations.
+`OBSERVED` on nine cases from a cross-SDK nested-route driver, and
+`PENDING-VERIFICATION` beyond them. The eight route cases — linked and
+runtime-loaded, each in static and dynamic linkage, each once with no target or
+CPU named and once with `-Dtarget=x86_64-linux-gnu -Dcpu=baseline` — each exited
+0 with `Build Summary: 7/7 steps succeeded` and the consumer program printed
+`committed records persisted, abandoned ones did not, both routes agreed`. The
+nested `zig build` line, read from `--verbose`, carried every flag named above,
+ending in `--` and the program arguments. The ninth case named `-Druntime=true`
+with no provider at all: it exited 1 with `error: NoProviderConfigured`, which is
+the refusal that case exists to require. Every provider environment variable was
+withheld from the child, so the loaded rows prove the argv route and not an
+environment fallback. The driver also read the nested prefix's install inventory
+and passed, which is what makes the `--prefix` relay observed rather than merely
+present in the source. **Not reached:** `-fsys=lmdb`, which still requires an
+installed provider and matching header; any optimization mode other than Debug;
+and any target other than the two named. The foreign robust-lock `ENOSYS`
+boundary is unchanged.
+
+## Reader callback results are not LMDB error statuses — 2026-10-04
+
+**Condition.** `mdb_reader_list` returns a callback result, not an LMDB errno:
+`mdb.c:12692-12695` rejects null arguments or returns the no-lock message's
+callback value; `:12705-12719` stops on a negative callback result and otherwise
+returns the last callback value. The facade's nonnull callback and `openHandle`
+guard already exclude invalid native arguments.
+
+**Symptom, OBSERVED before the correction.** The driver's real-environment
+probe returned `error.UnexpectedStatus` for callback `-1` after one invocation,
+and `error.AccessDenied` for callback `13` after two invocations. The `0` control
+was reported `CONTRACT_PASS`. Receipts are under
+`/home/tmp2/gertullj/scratch/foundation-libs/text-contract-probes/lmdb/epochs/before/reader-callback-status-before/`:
+`callback--1.json`, `callback-13.json`, `callback-0.json` and `build.json`.
+
+**Fix.** `listReaders` no longer sends the native callback result through
+`check`; it returns that integer unchanged. Its `Error!c_int` signature and
+existing `try` callers remain: `openHandle` genuinely rejects closed or unopened
+environment owners. No new panic or removal of ownership-state validation is
+introduced. Two real-environment regressions require `-1` to abort after the
+header and `13` to continue through the reader entry and remain `13`.
+
+**Target bound and status.** Linked and runtime-loaded reader-list calls.
+`OBSERVED` in the AFTER epoch `reader-callback-status-after`: the installed
+probe against a real LMDB environment, each row exit 0 and each classified
+`CONTRACT_PASS`. `callback--1.json` printed `OBSERVED requested=-1 returned=-1
+calls=1 saw_message=true`; `callback-13.json` printed `OBSERVED requested=13
+returned=13 calls=2 saw_message=true`; `callback-0.json` printed `OBSERVED
+requested=0 returned=0 calls=2 saw_message=true`. The receipts are under
+`/home/tmp2/gertullj/scratch/foundation-libs/text-contract-probes/lmdb/epochs/after/reader-callback-status-after/`,
+beside `build.json` and `aggregate.json`. That epoch covers the linked shape
+only; the permanent suite and the runtime-loaded shape stay
+`PENDING-VERIFICATION`. Native code and the foreign robust-lock `ENOSYS`
+boundary are unchanged.
+
+## The module link forces pkg-config too, and four source-bound gates are recorded — 2026-10-05
+
+**Condition.** The system-mode record said `-fsys=lmdb` binds an installed
+liblmdb "by pkg-config name `lmdb`, with `.force`", and named only the
+translation hop. The module hop was in the graph and out of the record.
+
+**What the graph does, `SOURCE-CONFIRMED` from `build.zig` and verified by no
+run.** `translate_c.linkSystemLibrary(pkg_config_name, .{ .use_pkg_config =
+.force })` at `build.zig:702` chooses the header the translation reads, and
+`module.linkSystemLibrary(pkg_config_name, .{ .use_pkg_config = .force,
+.preferred_link_mode = options.system_linkage })` at `build.zig:768-771` chooses
+what the published module links. One metadata source answers both, the selected
+installed linkage is the one the caller asked for, and the first named link
+entry wins. `zig build -fsys=lmdb` remains unrun and no result is claimed for
+it.
+
+**Four source-bound runs, each read out of a receipt the driver wrote, each
+holding one source stamp for its whole run.**
+
+* `zig build check` over the declared compile targets, 2026-10-05, label
+  `baseline-lmdb-check`, baseline run `20261005T014547Z-797a73f2`: exit 0,
+  `Build Summary: 36/36 steps succeeded`, no failing step, five targets seen.
+  `wasm32-wasi` is not one of the five, because this graph refuses it at
+  configure time.
+* `cross-test --jobs 8 --build-jobs 8`, 2026-10-04, run
+  `20261004T221720228710Z-45046`, receipt `lmdb-53-target-8.json`, source stamp
+  `208a5547821d…` identical before and after: exit 1, **1 pass, 32 build-only,
+  1 build failure, 19 run failures** of 53, 20 cells executed at 38 tests each,
+  `x86_64-linux` the only pass. The 19 failures share one frame,
+  `zig/root.zig:622` in `posixStatus` reached from `positiveStatus` `:607` ←
+  `check` `:560` ← `open` `:1169` ← `init` `:1139`: `mdb_env_open` returned an
+  errno the switch does not map, and the unmapped `else` arm at `:635` is
+  `error.UnexpectedStatus`. **These logs carry no `ENOSYS` string**, so the
+  robust-lock diagnosis above stands as the recorded cause and this run does
+  not prove it. The one build failure is `wasm32-wasi` and it is this graph's
+  own `refuseTarget`, not a defect.
+* Native final wave, `native-final-evidence/20261004T233628757747Z-69351`: eight
+  cells, both linkages × four modes, `zig build test smoke install
+  -Druntime=false`, eight `exit 0`, each `46/46 steps succeeded` and `38/38 tests
+  passed`.
+* Own-loaded wave, `loaded-final-evidence/20261004T232823091897Z-23133`: the same
+  eight shapes under `-Druntime=true`, eight `pass`, each `48/48 steps succeeded`
+  and `38/38 tests passed`.
+
+**What none of this covers.** Each run holds one source stamp, so every
+build-graph, header, helper and normalisation edit made afterwards is outside
+all four. The Nix outputs, the installed C consumer through `pkg-config`,
+`zig build interop`, the whole-record `sha256sum -c`, the filtered fetch with
+its consumer inside the copy and every gate in `.github/workflows/verify.yml`
+keep no receipt, and this entry quotes none.
+
+**Files.** `README.md`, `README.zig.md`, `CHANGELOG.md`. No upstream C byte,
+header, man page, licence file or fixture changed, and no algorithm,
+declaration, option, default, step or target changed. No build, test, matrix,
+Nix, devenv, formatter or git command was run for this entry.

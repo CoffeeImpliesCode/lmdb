@@ -26,6 +26,14 @@
         // The Zig facade, and its behavioural tests and deterministic smoke
         // program.
         "zig",
+        // The runtime route, and it is load-bearing rather than optional:
+        // `build.zig` imports `runtime/graph.zig` in *every* configuration, so
+        // a package without this directory cannot configure at all. Inside it,
+        // `graph.zig` and `library.zig` are this fork's own dispatch and ABI
+        // record, `loader.zig`/`generate.zig`/`sync.c`/`sync.h` are the reusable
+        // loader core that every SDK carries the same copy of, and the whole
+        // directory ships because `graph.zig` names all six of them by path.
+        "runtime",
         "tests.zig",
         "smoke.zig",
         // cross-test reads this settings-only profile from the package root to
@@ -41,7 +49,9 @@
         // The separate consumer package. It lives inside this repository so the
         // dependency it proves is a relative path that resolves without a
         // registry entry or a network fetch.
-        "consumer",
+        "consumer/build.zig",
+        "consumer/build.zig.zon",
+        "consumer/src/main.zig",
         // Full pinned native library, tools, headers, build definitions and
         // legal records. UPSTREAM.sha256 covers the same immutable tree.
         "libraries/liblmdb",
@@ -51,5 +61,29 @@
         "FORK-NOTES.md",
         "CHANGELOG.md",
         "NOTICE.md",
+        // The fork's own documentation and the standalone Nix and shell
+        // interface that documentation describes. `package.nix` is the single
+        // source-only derivation both `flake.nix` and `devenv.nix` call, so a
+        // consumer who received only this package could still build it with
+        // Nix; `.envrc` and `devenv.yaml` belong with them for the same reason.
+        // There is no `README.upstream.md` here and there will not be one:
+        // upstream's tree at the pinned commit carries no README at any depth,
+        // so there are no upstream README bytes to preserve separately, and
+        // README.md is the fork's own text from its first line.
+        "README.md",
+        "FORK-LICENSE.md",
+        "package.nix",
+        "flake.nix",
+        // `flake.lock` resolves `flake.nix`'s one input at the commit that file
+        // already names, and it travels with it: a package fetched through
+        // `.paths` that received `flake.nix` without its lock would resolve a
+        // floating input, which is exactly what the pin exists to prevent.
+        // `devenv.lock` is deliberately **not** listed — it does not exist in
+        // this tree and was not invented, so listing it would name a file no
+        // dependent could receive.
+        "flake.lock",
+        "devenv.nix",
+        "devenv.yaml",
+        ".envrc",
     },
 }

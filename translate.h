@@ -1,4 +1,10 @@
 /*
+ * SPDX-License-Identifier: OLDAP-2.8
+ *
+ * Fork-authored; that identifier matches the primary upstream grant this
+ * package ships (libraries/liblmdb/LICENSE), and FORK-LICENSE.md is the
+ * record.
+ *
  * translate.h — the single C translation unit this package has the Zig C
  * translator read.
  *

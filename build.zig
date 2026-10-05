@@ -1,38 +1,102 @@
 //! Build graph for the LMDB fork.
 //!
-//! Five things happen here and nothing else:
+//! Six things happen here and nothing else:
 //!
 //!   1. The upstream C core is compiled from an explicit three-file list out
 //!      of `libraries/liblmdb` - the three objects `liblmdb.a` is made of
 //!      upstream - for whichever target was asked for, with the shared-lock
 //!      backend that build chooses from the resolved target and, because
 //!      `module.c` is one of the three, the system library that platform keeps
-//!      its dynamic-loader entry points in.
+//!      its dynamic-loader entry points in. `-Dlinkage=static|dynamic` picks
+//!      which of upstream's two forms that is: the archive its `.o` objects
+//!      make, or the shared object its separately compiled `.lo` objects make
+//!      (`liblmdb/Makefile:87-94`, `:126-145`).
 //!   2. `translate.h` is read for the same target - preprocessed for it by the
 //!      same compiler that compiles the core in the default mode - so the Zig
 //!      facade's `c` import is generated from the header that sits next to the
 //!      code it binds.
 //!   3. The facade module is registered under the name `lmdb`, carrying the
-//!      archive and the header include path, so a dependent needs nothing but
+//!      library this build produced - or, in `-fsys=lmdb` mode, the installed
+//!      one - and the header include path, so a dependent needs nothing but
 //!      `dep.module("lmdb")`.
-//!   4. `check` compiles all of that - library, tests, smoke program and
-//!      interoperability program - for the whole target matrix, and proves the
+//!   4. The install prefix is the whole delivery and not only the library file:
+//!      the one header upstream installs, upstream's own five command-line tools
+//!      with the manual pages upstream installs for them,
+//!      a generated `lmdb.pc` whose link metadata names what this variant
+//!      really needs, and upstream's `LICENSE` and `COPYRIGHT` - the terms that
+//!      have to travel with a redistributed LMDB. The terms and this fork's
+//!      provenance records install at both `share/lmdb/` and
+//!      `share/licenses/lmdb/`; the second spelling is the one every other
+//!      package here uses and the one a recipient looks under first, and
+//!      neither directory was moved to make room for the other.
+//!   5. `check` compiles the core, the facade, the tests, the smoke program and
+//!      the interoperability program - not the installed tools, which is what
+//!      `zig build` itself builds - for the whole target matrix, and proves the
 //!      one target in the matrix that has no lock backend is refused rather
 //!      than quietly skipped.
-//!   5. `interop` builds upstream's own `mdb_dump` from the sources in this
+//!   6. `interop` builds upstream's own `mdb_dump` from the sources in this
 //!      repository and runs the interoperability program against it, so the
 //!      package's primary fixture is a reference reader and not this facade
 //!      agreeing with itself.
+//!
+//! Two option pairs shape this graph and they are orthogonal. `-Dlinkage`
+//! chooses which of upstream's two forms this build delivers and installs.
+//! `-Druntime` chooses how the facade reaches it: through a link line, which is
+//! the default, or through a table an explicit `load` fills. Under `-Druntime`
+//! nothing is linked into the module at all, so a caller may name a provider
+//! this tree did not build - and the artifact is still built and installed, so
+//! a caller may equally name the one it did.
+
+// SPDX-License-Identifier: OLDAP-2.8
+//
+// The identifier matches the primary upstream grant this package ships -
+// `libraries/liblmdb/LICENSE`, the OpenLDAP Public License v2.8, unmodified -
+// and is the owner-authorized choice for this fork's own additions; the record
+// is FORK-LICENSE.md. It belongs on fork-authored files only: nothing under
+// `libraries/liblmdb/` carries it, because that tree is what UPSTREAM.sha256
+// hashes byte for byte.
 
 const std = @import("std");
 
 const manifest = @import("build.zig.zon");
 
-/// The upstream release this fork is pinned to. `mdb.c` and `lmdb.h` are used
-/// byte-for-byte as they are at this commit: the package names the four files
-/// it needs individually in build.zig.zon rather than shipping a directory, so
-/// what is compiled is exactly what the pin names and nothing that appeared
-/// beside it later.
+/// The runtime-loading build half, which the API role owns. It exposes
+///
+///     pub fn createModule(
+///         b: *std.Build,
+///         translate: *std.Build.Step.TranslateC,
+///         target: std.Build.ResolvedTarget,
+///         optimize: std.builtin.OptimizeMode,
+///     ) *std.Build.Module
+///
+/// and `-Druntime` substitutes that one call for `translate.createModule()`.
+/// It takes the `TranslateC` step this build has already made, so the generated
+/// dispatch keeps the exact translated type and constant namespace instead of
+/// compiling a second copy of the native extern structs and casting between
+/// two modules that call them the same names.
+///
+/// `createCoreModule` builds the loader core for the *linked* branch, which has
+/// no dispatch to carry `LoadSource` and `LoadError` and takes them from
+/// `zig/root.zig:243` instead. The two branches must not both build it: the
+/// runtime branch's `createModule` makes the one core instance the dispatch
+/// uses and re-exports those two types from it, so a second instance would be
+/// two nominally distinct `LoadSource` types, and a consumer naming one while
+/// `lmdb.load` expects the other is a compile error at best.
+///
+/// The identifier is spelled out instead of `graph` because this file already
+/// uses `graph` for the package `addLmdb` returns, and one name meaning two
+/// things in the same file is how a wiring mistake hides.
+const runtime_graph = @import("runtime/graph.zig");
+
+/// The upstream release this fork is pinned to. `mdb.c`, `midl.c`, `module.c`
+/// and `lmdb.h` are used byte-for-byte as they are at this commit, and so are
+/// the five tool sources and the five manual pages the installed delivery
+/// carries, which is why build.zig.zon ships the whole `libraries/liblmdb`
+/// directory instead of naming files: `UPSTREAM.sha256` records every file in
+/// it anyway. What is *compiled* is named file by file in `core_sources`,
+/// `tool_sources` and `installed_tools` below, so a file appearing upstream
+/// cannot join the archive or the installed set without being a decision in
+/// this file.
 ///
 /// Only `version` is asserted here, against build.zig.zon's `.version`, so a
 /// manifest edit that claims a different LMDB cannot configure. `commit` and
@@ -46,6 +110,17 @@ const upstream = struct {
     /// lmdb.h:235-239 declares 1, 0 and 1 at that commit.
     const version: std.SemanticVersion = .{ .major = 1, .minor = 0, .patch = 1 };
 
+    /// The ABI series of the shared library upstream builds from the same
+    /// three objects: `LIBVER = 1`, `ABIVER = 0`, `VEREXT = $(LIBVER).$(ABIVER)`
+    /// (liblmdb/Makefile:33-35) gives `SOVER = liblmdb.so.1` (:56), and
+    /// `-Wl,-soname,$(SOVER)` (:57) records that as the soname. Zig names a
+    /// shared library's soname from the major component of the version the
+    /// artifact is given, so this is the value that has to equal
+    /// `version.major` for the shared object this build produces to sit in the
+    /// same ABI series as upstream's. `build()` asserts it; what the produced
+    /// object actually records is the driver's to read out of the artifact.
+    const soname_major: u32 = 1;
+
     /// Where the upstream C core lives in this repository.
     const source_dir = "libraries/liblmdb";
 };
@@ -55,14 +130,14 @@ const upstream = struct {
 /// `liblmdb/Makefile:87-88` builds `liblmdb.a` from `mdb.o midl.o module.o`
 /// and `liblmdb/Makefile:90-92` builds the shared `liblmdb.so.1.0` from
 /// `mdb.lo midl.lo module.lo` with the same three, so upstream ships these
-/// objects in both forms and this archive is the same one. `module.c` is the
+/// objects in both forms and this build produces the same one. `module.c` is the
 /// dynamic crypto-module loader - `mdb_modload`, `mdb_modsetup` and
 /// `mdb_modunload`, all three declared in the public header at
-/// lmdb.h:1899-1918 - and it is in the archive, so it is in this archive: a
-/// package whose archive left it out is not the library this pin names, and
-/// upstream's own `mdb_dump` would not link against it. Whether this fork's
-/// Zig facade happens to call those entry points is not a question this list
-/// gets to ask. The C library is what is being reproduced here, and the C
+/// lmdb.h:1899-1918 - and it is in `liblmdb.a`, so it is in whatever this
+/// build produces: a package whose core left it out is not the library this pin
+/// names, and upstream's own `mdb_dump` would not link against it. Whether this
+/// fork's Zig facade happens to call those entry points is not a question this
+/// list gets to ask. The C library is what is being reproduced here, and the C
 /// tools that consume it name the loader whether or not they were given
 /// `-m` (mdb_dump.c:270, :275, :364).
 ///
@@ -73,7 +148,7 @@ const upstream = struct {
 /// named by no rule in that Makefile at all. Nothing in these three
 /// references any of them. So the three translation units are named one by one
 /// rather than globbed, and a file appearing upstream cannot silently join the
-/// archive.
+/// core.
 const core_sources = [_][]const u8{
     "mdb.c",
     "midl.c",
@@ -85,18 +160,110 @@ const core_sources = [_][]const u8{
 ///
 /// `mdb_dump` is upstream's own dump tool and nothing here reimplements it:
 /// the gate runs it and compares its output against the facade's. It is
-/// compiled alone and linked against the complete archive this build
-/// produces, which is how upstream links it - `mdb_dump: mdb_dump.o
+/// compiled alone and linked against the complete library this build produces,
+/// which is how upstream links it - `mdb_dump: mdb_dump.o
 /// liblmdb.a` and `$(CC) $(LDFLAGS) -o $@ $^ $(LDL)`
 /// (liblmdb/Makefile:100-101) - so the `mdb_modload`, `mdb_modsetup` and
 /// `mdb_modunload` references it makes unconditionally resolve to the same
-/// `module.o` a consumer of the installed library gets, from the same archive
-/// rather than from a second copy of the unit compiled beside the tool.
+/// `module.o` a consumer of the installed library gets, from the same library
+/// this build produced rather than from a second copy of the unit compiled
+/// beside the tool.
 ///
 /// Named one by one, like the core: a tool appearing upstream cannot join the
 /// reference oracle without being a decision in this file.
 const tool_sources = [_][]const u8{
     "mdb_dump.c",
+};
+
+/// The command-line tools this package installs, and the manual page it
+/// installs for each: upstream's own `IPROGS` (liblmdb/Makefile:52) with its
+/// `IDOCS` (:53), in the order its install rule copies them (:70, :78).
+///
+/// Each one is built from the sources in this repository and linked against the
+/// artifact this build produced. Upstream links all five the same way, against
+/// its own archive (`mdb_stat: mdb_stat.o liblmdb.a` and its four siblings,
+/// liblmdb/Makefile:96-105); this build follows the artifact rather than the
+/// form, so under `-Dlinkage=dynamic` the tools are linked against the shared
+/// object this build just produced and need it beside them at run time. Named
+/// one by one, like the core and the oracle: a tool appearing upstream cannot
+/// join the installed set without being a decision in this file.
+const InstalledTool = struct {
+    name: []const u8,
+    source: []const u8,
+    man_page: []const u8,
+};
+
+const installed_tools = [_]InstalledTool{
+    .{ .name = "mdb_stat", .source = "mdb_stat.c", .man_page = "mdb_stat.1" },
+    .{ .name = "mdb_copy", .source = "mdb_copy.c", .man_page = "mdb_copy.1" },
+    .{ .name = "mdb_dump", .source = "mdb_dump.c", .man_page = "mdb_dump.1" },
+    .{ .name = "mdb_load", .source = "mdb_load.c", .man_page = "mdb_load.1" },
+    .{ .name = "mdb_drop", .source = "mdb_drop.c", .man_page = "mdb_drop.1" },
+};
+
+/// The terms that have to travel with a redistributed LMDB, installed byte for
+/// byte out of the pinned tree: `LICENSE` is the OpenLDAP Public License v2.8
+/// text upstream ships, and `COPYRIGHT` is upstream's own notice beside it.
+/// Upstream's install rule copies neither (liblmdb/Makefile:65-78), and the
+/// notices that are per file - the ISC-style grant inside the installed
+/// `lmdb.h` (lmdb.h:151-166), the ones inside `mdb.c` (mdb.c:19-33 and the
+/// conditional grant at :5846-5872 under the `MDB_USE_HASH` guard on :5845),
+/// and the public-domain notice in the retained, uncompiled `chacha8.c` -
+/// travel with the file each of them is written in.
+const licence_files = [_][]const u8{
+    "LICENSE",
+    "COPYRIGHT",
+};
+
+/// The fork's own provenance records, installed beside upstream's legal files
+/// for the same reason and into the same directory.
+///
+/// The owner authorized these additions under this package's primary upstream
+/// terms, so a redistributed binary carries their notices as well as upstream's
+/// ones: condition 2 asks for the notices that travel with the code, and the
+/// fork's half is now one of them. `FORK-LICENSE.md` is the record of the
+/// authorization and of which grant it is.
+///
+/// They travel as records, not as build inputs. `UPSTREAM.sha256` names paths
+/// relative to the package root and cannot be run from an install prefix, so it
+/// is installed as the record it is and not as something the prefix claims to
+/// satisfy; nothing here reads any of them.
+const provenance_files = [_][]const u8{
+    "NOTICE.md",
+    "FORK-LICENSE.md",
+    "UPSTREAM.md",
+    "UPSTREAM.sha256",
+    "README.md",
+    "README.zig.md",
+    "CHANGELOG.md",
+    "FORK-NOTES.md",
+};
+
+/// Every licence, notice and provenance record installed under
+/// `share/licenses/lmdb/`, as `source -> installed name` pairs.
+///
+/// `share/lmdb/` above already carries these bytes, and it keeps doing so: that
+/// directory is where the two loops in `build` put upstream's terms and this
+/// fork's records, and moving them would remove an installed path rather than
+/// add one. `share/licenses/lmdb/` is the second spelling, and it is the one
+/// every other package in this workspace uses, so a recipient who looks for
+/// terms where a package's terms normally live finds them.
+///
+/// `LICENSE` is the OpenLDAP Public License v2.8 text upstream ships at
+/// `libraries/liblmdb/LICENSE`, copied byte for byte and not rewritten, and
+/// `COPYRIGHT` is upstream's own notice beside it. The remaining five are this
+/// fork's records: the inventory, the owner-authorised grant, the pin, the
+/// integrity digests and what this fork changed about the pinned tree. `README.md`
+/// and `CHANGELOG.md` travel under `share/lmdb/` and are not repeated here; they
+/// are this fork's documentation, not terms.
+const licence_records = [_]struct { source: []const u8, installed: []const u8 }{
+    .{ .source = "libraries/liblmdb/LICENSE", .installed = "LICENSE" },
+    .{ .source = "libraries/liblmdb/COPYRIGHT", .installed = "COPYRIGHT" },
+    .{ .source = "NOTICE.md", .installed = "NOTICE.md" },
+    .{ .source = "FORK-LICENSE.md", .installed = "FORK-LICENSE.md" },
+    .{ .source = "UPSTREAM.md", .installed = "UPSTREAM.md" },
+    .{ .source = "FORK-NOTES.md", .installed = "FORK-NOTES.md" },
+    .{ .source = "UPSTREAM.sha256", .installed = "UPSTREAM.sha256" },
 };
 
 /// The language level, pinned rather than inherited from the compiler default.
@@ -109,6 +276,21 @@ const tool_sources = [_][]const u8{
 const c_flags = [_][]const u8{
     "-std=gnu17",
 };
+
+/// The core's compile flags for the linkage that was asked for.
+///
+/// Upstream compiles the archive from `.o` objects and the shared object from
+/// `.lo` objects, and the only difference between those two rules is `-fPIC`
+/// (liblmdb/Makefile:126-139 against :144-145). So the static default keeps
+/// exactly the flags this build has always used, and `-Dlinkage=dynamic` adds
+/// the one upstream adds - on every target but Windows, where a PE/COFF object
+/// has no position-independent form to need and `-fPIC` is not part of that
+/// toolchain's vocabulary. Nothing else varies with the linkage: same language
+/// level, same sources, same macros, same translation.
+fn coreCFlags(linkage: std.builtin.LinkMode, os_tag: std.Target.Os.Tag) []const []const u8 {
+    if (linkage == .dynamic and os_tag != .windows) return &.{ "-std=gnu17", "-fPIC" };
+    return &c_flags;
+}
 
 /// Fork-authored roots. These are the only files outside build.zig that this
 /// build knows how to compile, and they are named here so that a rename is a
@@ -130,6 +312,13 @@ const translate_header = "translate.h";
 const module_name = "lmdb";
 const c_import_name = "c";
 const pkg_config_name = "lmdb";
+
+/// The loader-core import name inside `zig/root.zig:243`. It is named in this
+/// file because the linked configuration has to hand the facade that module
+/// and the runtime configuration deliberately must not: the runtime branch
+/// takes the two public types from the dispatch, which re-exports them from the
+/// one core instance it built itself.
+const rt_import_name = "rt";
 
 /// The matrix `zig build check` compiles when it was not given a `-Dtarget`.
 /// Each triple is a target whose lock backend this build names and whose C
@@ -239,9 +428,8 @@ fn lockBackend(os_tag: std.Target.Os.Tag) ?LockBackend {
 /// `module.c` takes one of two arms: `<windows.h>` and the Win32 loader under
 /// `_WIN32` (module.c:14-15, :33-49, :74-76), `<dlfcn.h>` and the POSIX loader
 /// everywhere else (module.c:16-18, :50-67, :77-78). A static archive does not
-/// resolve anything, so the calls it contains are resolved by whatever links
-/// the archive, and this is the one place that has to say what they resolve
-/// against. It is driven by the resolved target's `os.tag`, the target being
+/// resolve anything, so the calls it contains are resolved by whatever links the
+/// artifact. It is driven by the resolved target's `os.tag`, the target being
 /// compiled, and reads nothing about the machine running the build.
 fn loaderSystemLibraries(os_tag: std.Target.Os.Tag) []const []const u8 {
     switch (os_tag) {
@@ -389,6 +577,25 @@ const LmdbPackage = struct {
 const LmdbOptions = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    /// `-Dlinkage`: which of upstream's two forms of this library to build.
+    /// Static is the default and is what this package has always delivered;
+    /// dynamic builds the same three objects the way upstream's `.lo` rules
+    /// build them. It says nothing about an installed library.
+    linkage: std.builtin.LinkMode,
+    /// Which kind of *installed* library `-fsys=lmdb` binds to. Dynamic unless
+    /// `-Dlinkage` was actually given, because that is what
+    /// `Module.linkSystemLibrary` already does when no preference is passed
+    /// (`lib/std/Build/Module.zig`, `SystemLib.preferred_link_mode`). A plain
+    /// `-fsys=lmdb` has to keep binding what it binds today, and the artifact
+    /// default says nothing about this, so it is a separate field with its own
+    /// default rather than a second reading of `linkage`.
+    system_linkage: std.builtin.LinkMode,
+
+    /// `-Druntime`: whether the facade reaches the native library through a
+    /// link line or through a table an explicit `load` fills. It says nothing
+    /// about which artifact is built, which is `linkage`; the two are read
+    /// independently and neither implies the other.
+    runtime_loaded: bool,
     /// `-fsys=lmdb`: link and translate the installed library and header
     /// instead of building this repository's.
     use_system: bool,
@@ -451,7 +658,7 @@ fn preprocessedHeader(b: *std.Build, options: LmdbOptions) std.Build.LazyPath {
         run.addArg(triple);
     }
     // The bundled header, the same directory the C core is compiled against,
-    // so `<lmdb.h>` names the header the archive was built with and not a
+    // so `<lmdb.h>` names the header the core was built with and not a
     // header some system include path happens to carry. It is a `-I` of the
     // preprocessor rather than of the translation line because the preprocessed
     // file is what the translation line reads, and by then there is no
@@ -513,17 +720,55 @@ fn addLmdb(b: *std.Build, options: LmdbOptions) error{UnsupportedTarget}!LmdbPac
         b.addModule(module_name, module_options)
     else
         b.createModule(module_options);
-    module.addImport(c_import_name, if (options.register_module)
-        translate_c.addModule(c_import_name)
-    else
-        translate_c.createModule());
+    // The runtime seam, and the only place in this file where the two
+    // configurations differ in *what the module carries*.
+    //
+    // Linked, unchanged: the translated header is the `c` import, registered
+    // when this is the package's published module, and the loader core is
+    // imported as `rt` because the facade's own `LoadSource`/`LoadError` are
+    // public types that have to be the same types a caller names in either
+    // configuration (`zig/root.zig:243`, :264, :270). `runtime/graph.zig` says
+    // the same thing from the other side, and that nothing of that module is
+    // compiled in this configuration, so it costs two declarations here.
+    //
+    // Runtime-loaded: `c` is the generated dispatch instead, it is never
+    // registered - a dependent has no business importing generated types under
+    // `dep.module("c")` - and no `rt` import is added, because the dispatch
+    // re-exports the two types from the core instance it built itself. The
+    // facade's `@import("rt")` is resolved only where it is referenced, and the
+    // comptime branch at `zig/root.zig:256` never reaches it in this branch.
+    if (options.runtime_loaded) {
+        module.addImport(c_import_name, runtime_graph.createModule(
+            b,
+            translate_c,
+            options.target,
+            options.optimize,
+        ));
+    } else {
+        module.addImport(c_import_name, if (options.register_module)
+            translate_c.addModule(c_import_name)
+        else
+            translate_c.createModule());
+        module.addImport(rt_import_name, runtime_graph.createCoreModule(
+            b,
+            options.target,
+            options.optimize,
+        ));
+    }
 
     var artifact: ?*std.Build.Step.Compile = null;
     if (options.use_system) {
-        // `-llmdb`, and no include path: a consumer that compiles its own C
-        // against this module uses the same installed header the translation
-        // just used.
-        module.linkSystemLibrary(pkg_config_name, .{ .use_pkg_config = .no });
+        // The installed library, through the same `lmdb.pc` the translation
+        // above queried. `.force` on both the translation and this facade keeps
+        // the selected header and the link metadata coherent, and the first
+        // named link entry wins.
+        //
+        // Guarded: under `-Druntime` the platform loader resolves the entry
+        // points itself, so a hard link here would defeat that mode.
+        if (!options.runtime_loaded) module.linkSystemLibrary(pkg_config_name, .{
+            .use_pkg_config = .force,
+            .preferred_link_mode = options.system_linkage,
+        });
     } else {
         // Consumers that compile their own C against this module need the same
         // header the library was compiled with.
@@ -533,14 +778,15 @@ fn addLmdb(b: *std.Build, options: LmdbOptions) error{UnsupportedTarget}!LmdbPac
         // library added to it a few lines further down, is the whole link
         // configuration. Upstream's own records put `-pthread` on the line
         // (liblmdb/Makefile:24, and `Libs: -llmdb -ldl -pthread` in lmdb.pc),
-        // and it is repeated in the `zig cc` step of
-        // .github/workflows/verify.yml for the plain C consumer that links this
-        // archive directly. It is not repeated here because Zig's libc carries
-        // the POSIX threads entry points inside libc itself on every target
-        // this build supports, and asking the linker for a separate libpthread
+        // and it is repeated in the `zig cc` steps of
+        // .github/workflows/verify.yml for the plain C consumers that link the
+        // installed artifact directly. It is not repeated here because Zig's
+        // libc carries the POSIX threads entry points inside libc itself on
+        // every target this build supports, and asking the linker for a
+        // separate libpthread
         // would turn a library that is already complete into a search for a
         // file that only exists on the machine running the build. `-ldl` is a
-        // different matter and is not dropped: `module.c` is in the archive and
+        // different matter and is not dropped: `module.c` is in the core and
         // calls it, which is why it is the one upstream puts on every tool's
         // line (liblmdb/Makefile:97-105) and in the installed `Libs:`.
         const core = b.createModule(.{
@@ -567,16 +813,30 @@ fn addLmdb(b: *std.Build, options: LmdbOptions) error{UnsupportedTarget}!LmdbPac
         // (lib/std/Build/Step/Compile.zig:1064-1088), so this one declaration
         // reaches the facade, the tests, the smoke program, the
         // interoperability program and upstream's `mdb_dump` - the same reach
-        // upstream records for `-ldl` (liblmdb/Makefile:97-105, :158). For a
-        // static archive the entry is inert: `zig build-lib` runs no linker,
-        // and the archive carries the three upstream objects unchanged.
+        // upstream records for `-ldl` (liblmdb/Makefile:97-105, :158).
+        //
+        // For a static archive the entry is inert here - `zig build-lib` runs
+        // no linker, and the archive carries the three upstream objects
+        // unchanged - and it is what resolves `mdb_modload`'s `dlopen` in a
+        // program that pulls `module.o` out of that archive. For the shared
+        // object the same declaration is on the library's own link line, so
+        // the loader records liblmdb's own dependency on `libdl`
+        // (`lib/std/Build/Step/Compile.zig:1088-1159`), and a program linking
+        // the shared object is right not to repeat it. It is a plain `-l` and
+        // not a forced `-needed-l`: `module.o` really calls `dl*`, so
+        // `--as-needed` keeps the entry exactly when the loader is used and
+        // drops it when nothing pulls that object out of an archive.
         for (loaderSystemLibraries(options.target.result.os.tag)) |system_lib| {
             core.linkSystemLibrary(system_lib, .{ .use_pkg_config = .no });
         }
         core.addCSourceFiles(.{
             .root = b.path(upstream.source_dir),
             .files = &core_sources,
-            .flags = &c_flags,
+            // `-fPIC` for the shared object, and nothing added for the archive:
+            // that one difference between upstream's `.lo` and `.o` rules is
+            // all this option reaches in the C compiler line. `coreCFlags` says
+            // why Windows is not given it.
+            .flags = coreCFlags(options.linkage, options.target.result.os.tag),
         });
         // No -D for anything else. `_GNU_SOURCE`, `_FILE_OFFSET_BITS`, the
         // `BROKEN_FDATASYNC` probe, `MDB_DSYNC`, `MDB_RPAGE_CACHE` and
@@ -585,11 +845,30 @@ fn addLmdb(b: *std.Build, options: LmdbOptions) error{UnsupportedTarget}!LmdbPac
         // another machine would put one target's feature macros on another.
         artifact = b.addLibrary(.{
             .name = module_name,
-            .linkage = .static,
+            // Static is the default and is the artifact this package has always
+            // produced; `-Dlinkage=dynamic` builds the same three objects as a
+            // shared library. The version is the pinned release either way, and
+            // in the shared case it is what gives the installed file its
+            // `liblmdb.so.1` and `liblmdb.so` links - the same ABI series
+            // string upstream's own soname names (`liblmdb/Makefile:56-57`).
+            // Nothing is exported or hidden beyond what upstream ships: no
+            // version script and no `-fvisibility=hidden` (`:90-94`), so the
+            // shared object exports the non-static definitions of the three
+            // units, which is upstream's own arrangement.
+            .linkage = options.linkage,
             .version = upstream.version,
             .root_module = core,
         });
-        module.linkLibrary(artifact.?);
+        // Deliberately absent under `-Druntime`. The artifact above is still
+        // built and still installed - delivery and dispatch are separate
+        // questions, and the point of the mode is that a caller may name a
+        // provider this tree did not build - but linking it into this module
+        // would let the linker resolve those symbols first, and the runtime
+        // route would quietly be a linked one. Nothing else in the graph may
+        // reference the archive for the same reason; the installed tools and
+        // the interoperability oracle are separate executables that link it
+        // deliberately, and neither imports `c`.
+        if (!options.runtime_loaded) module.linkLibrary(artifact.?);
     }
 
     return .{ .module = module, .artifact = artifact };
@@ -609,12 +888,16 @@ fn addLmdb(b: *std.Build, options: LmdbOptions) error{UnsupportedTarget}!LmdbPac
 /// are: a harness that compares this library with a reference one rots the
 /// moment it stops being compiled, and a harness that never compiles is not
 /// evidence of anything. What this step does not do is run it - the run is
-/// `interop`, below, and only for a target this host can execute.
+/// `interop`, below, and only for a target this host can execute. The
+/// linkage is the one the command line asked for, so the same matrix can be
+/// compiled against the archive and against the shared object.
 fn addTargetCheck(
     b: *std.Build,
     step: *std.Build.Step,
     query: std.Target.Query,
     optimize: std.builtin.OptimizeMode,
+    linkage: std.builtin.LinkMode,
+    runtime_loaded: bool,
 ) error{UnsupportedTarget}!void {
     const triple = query.zigTriple(b.allocator) catch @panic("OOM");
     defer b.allocator.free(triple);
@@ -627,6 +910,10 @@ fn addTargetCheck(
     const graph = try addLmdb(b, .{
         .target = cross_target,
         .optimize = optimize,
+        .linkage = linkage,
+        .runtime_loaded = runtime_loaded,
+        // Unused here and deliberately so: this graph is never the system one.
+        .system_linkage = linkage,
         .use_system = false,
         .register_module = false,
     });
@@ -673,7 +960,7 @@ fn addTargetCheck(
 /// package's writer and upstream's own reader.
 ///
 /// The oracle is a program built here, out of the unmodified sources in this
-/// repository, linked against the same core archive and the same `lmdb.h` the
+/// repository, linked against the same core artifact and the same `lmdb.h` the
 /// facade's translation came from. That is deliberate: an `mdb_dump` found on
 /// the machine running the build would be some other version of the reader,
 /// and agreeing with it would say nothing about the pin this package names.
@@ -686,12 +973,16 @@ fn addTargetCheck(
 /// program is run only when this host can execute that target
 /// (`hostCanExecute`), which is the same rule `consumer` follows and for the
 /// same reason. A target with no executor here is compiled without the
-/// comparison, which is compile evidence and nothing more.
+/// comparison, which is compile evidence and nothing more. The reference tool
+/// is linked against the artifact the command line asked for, so the same
+/// fixture is measured against the archive and against the shared object.
 fn addInterop(
     b: *std.Build,
     step: *std.Build.Step,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    linkage: std.builtin.LinkMode,
+    runtime_loaded: bool,
 ) error{UnsupportedTarget}!void {
     const backend = lockBackend(target.result.os.tag) orelse
         return refuseTarget(b, target);
@@ -699,6 +990,10 @@ fn addInterop(
     const graph = try addLmdb(b, .{
         .target = target,
         .optimize = optimize,
+        .linkage = linkage,
+        .runtime_loaded = runtime_loaded,
+        // Unused here, as above: the oracle is always this repository's.
+        .system_linkage = linkage,
         .use_system = false,
         .register_module = false,
     });
@@ -725,13 +1020,19 @@ fn addInterop(
     tools.addIncludePath(b.path(upstream.source_dir));
     for (backend.macros) |macro| tools.addCMacro(macro.name, macro.value);
     // Only the tool's own translation unit is compiled here. Everything else
-    // `mdb_dump` needs is the archive this package just built: `tools` links it
-    // below, and that link brings the loader's system library with it, because
-    // the archive is produced by `core`, which is where that dependency is
-    // declared. That is upstream's own arrangement rather than a local one -
-    // `mdb_dump: mdb_dump.o liblmdb.a`, linked with `$(LDL)`
-    // (liblmdb/Makefile:100-101), from an archive that already contained
-    // `module.o` (liblmdb/Makefile:87-88).
+    // `mdb_dump` needs is the library this package just built: `tools` links it
+    // below. Under the archive that link also brings the loader's system
+    // library with it, because the archive is produced by `core`, which is
+    // where that dependency is declared, and Zig re-emits a static library's
+    // own link objects for everything that links it
+    // (`lib/std/Build/Step/Compile.zig:1064-1088`); under the shared object the
+    // dependency is already recorded inside it and this executable reaches the
+    // library through an rpath Zig adds for that case
+    // (`lib/std/Build/Step/Compile.zig:1192-1199`), which is what lets the tool
+    // be run out of the cache. Either way it is upstream's own arrangement
+    // rather than a local one - `mdb_dump: mdb_dump.o liblmdb.a`, linked with
+    // `$(LDL)` (liblmdb/Makefile:100-101), from an archive that already
+    // contained `module.o` (liblmdb/Makefile:87-88).
     tools.addCSourceFiles(.{
         .root = b.path(upstream.source_dir),
         .files = &tool_sources,
@@ -756,6 +1057,150 @@ fn addInterop(
     // cached: the run is the result.
     run_interop.has_side_effects = true;
     step.dependOn(&run_interop.step);
+}
+
+/// The rpath an installed executable in this package needs, or null where the
+/// platform has no such notion.
+///
+/// `bin/<program>` and `lib/lib<name>` are siblings under one prefix, so
+/// `$ORIGIN/../lib` is the ELF spelling and `@loader_path/../lib` the Mach-O
+/// one. Windows has neither: a DLL beside the executable is what its loader
+/// looks for, and `liblmdb.dll` installs into `bin/` for exactly that reason.
+///
+/// Zig has already added an rpath to the library's own location in the build
+/// cache to every executable that links a dynamic artifact
+/// (`lib/std/Build/Step/Compile.zig:1192-1199`), which is what lets such a
+/// program run out of the cache. This one is what lets the installed copy find
+/// the installed library after the cache is gone. In the static variant it is an
+/// unused entry and costs nothing.
+fn installedRPath(os_tag: std.Target.Os.Tag) ?[]const u8 {
+    return switch (os_tag) {
+        .windows => null,
+        .macos, .maccatalyst => "@loader_path/../lib",
+        else => "$ORIGIN/../lib",
+    };
+}
+
+/// Installs every carried licence text and provenance record under
+/// `share/licenses/lmdb/`.
+///
+/// These are copies of files already in this repository, byte for byte;
+/// nothing is rewritten, merged or truncated on the way out. `b.installFile`
+/// takes a repository path and attaches its own step to the install step
+/// (`lib/std/Build.zig:1675-1677`), so this needs no separate `dependOn` —
+/// which is why the list above, and not a directory copy, is what makes the
+/// install complete: a missing entry is a build failure naming the file.
+fn installLicenceRecords(b: *std.Build) void {
+    for (licence_records) |record| {
+        b.installFile(record.source, b.fmt("share/licenses/{s}/{s}", .{ module_name, record.installed }));
+    }
+}
+
+/// The link libraries a consumer of the *archive* has to add itself, read out
+/// of the same per-target table the core's own link line is built from so the
+/// two can never disagree about what a target needs.
+fn pkgConfigPrivateLibs(b: *std.Build, os_tag: std.Target.Os.Tag) []const u8 {
+    const system_libs = loaderSystemLibraries(os_tag);
+    if (system_libs.len > 1) @panic("lmdb: build.zig internal error: more than one loader library for this operating system");
+    // `-pthread` is upstream's own record (`THREADS`, liblmdb/Makefile:24) and
+    // is not a flag on Windows, where the threads entry points are in the C
+    // runtime itself.
+    if (os_tag == .windows) {
+        return if (system_libs.len == 0) "" else b.fmt("-l{s}", .{system_libs[0]});
+    }
+    if (system_libs.len == 0) return "-pthread";
+    return b.fmt("-l{s} -pthread", .{system_libs[0]});
+}
+
+/// The `lmdb.pc` this variant needs, generated rather than copied.
+///
+/// Upstream generates one from its Makefile (liblmdb/Makefile:147-158) with a
+/// single line for the library and a single line for everything a consumer has
+/// to link beside it. Two facts make one line wrong for this package.
+///
+/// The first is that the two variants need different things. The archive's
+/// `module.o` calls `dlopen`, so a static consumer needs the loader library and
+/// the threads flag on its own link line; the shared object records both
+/// itself, so a consumer that repeated them would link state the loaded library
+/// already has. That is what `Libs.private` is for, and why it is only emitted
+/// for the static variant: pkg-config adds `Libs.private` to a `--static`
+/// query and leaves it out of an ordinary one, which is exactly the
+/// distinction being recorded here.
+///
+/// The second is that only one of those libraries is a real file on any given
+/// target: `-ldl` is a GNU/Linux name, there is no separate `libdl` on Darwin
+/// or the BSDs, and the Windows loader entry points come from `kernel32`.
+/// `pkgConfigPrivateLibs` reads that out of `loaderSystemLibraries` rather than
+/// repeating it.
+///
+/// `Version:` is this pin, 1.0.1, where upstream's own rule hardcodes 1.0.0
+/// (`LMDB_VERSION = 1.0.0`, liblmdb/Makefile:36) for the same 1.0.1 sources: a
+/// generated file that misreports the library it sits next to is worse than
+/// one that reports the release the sources came from.
+///
+/// `prefix` is derived from this file's own directory so the metadata is
+/// correct wherever the prefix lands, which is what both `zig build install
+/// --prefix` and a Nix output need. That spelling needs pkg-config 0.29 or
+/// newer, or pkgconf; it is the reason the file says so rather than
+/// hardcoding `/usr/local` the way upstream's rule does.
+///
+/// `Cflags` carries the `-I${includedir}` that upstream's rule never writes.
+/// Its `Cflags: $(THREADS) $(XCFLAGS)` (liblmdb/Makefile:157) names the threads
+/// flag and nothing else, because `XCFLAGS` is assigned nowhere in that
+/// Makefile and expands empty — so upstream's file defines `includedir`
+/// (`:150`), defines `libdir` (`:151`), and then never puts either on a
+/// `Cflags:` or `Libs:` line. A consumer that takes `pkg-config --cflags lmdb`
+/// gets no include path at all and cannot find `lmdb.h`, in an installed
+/// prefix or any other. Both fields are written here, against the same
+/// `includedir` and `libdir` the installed header and library actually live
+/// under.
+fn pkgConfigFile(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    linkage: std.builtin.LinkMode,
+) std.Build.LazyPath {
+    // `-I${includedir}` is unconditional: there is exactly one installed
+    // `lmdb.h`, on every target, and `installHeader` puts it under
+    // `<prefix>/include`, which is what this resolves to. `-pthread` is
+    // upstream's own record (`THREADS`, liblmdb/Makefile:24) and is not a flag
+    // on Windows, where the threads entry points are in the C runtime itself.
+    const cflags: []const u8 = if (target.result.os.tag == .windows)
+        "-I${includedir}"
+    else
+        "-I${includedir} -pthread";
+    const private = if (linkage == .dynamic)
+        ""
+    else
+        pkgConfigPrivateLibs(b, target.result.os.tag);
+    // The shared object records the loader and threads dependencies itself, so
+    // there is nothing left for a `--static` consumer to resolve and the field
+    // is dropped rather than emitted empty. A file ending in a bare
+    // `Libs.private:` reads as an answer that was lost rather than as the
+    // deliberate empty one it is, and `pkg-config --static --libs lmdb` cannot
+    // tell the two apart either.
+    const private_field: []const u8 = if (private.len == 0)
+        ""
+    else
+        b.fmt("Libs.private: {s}\n", .{private});
+
+    return b.addWriteFiles().add("lmdb.pc", b.fmt(
+        \\# Generated by lmdb/build.zig from the sources in this package. Do not edit.
+        \\# `prefix` is this file's own directory, so the metadata is right wherever
+        \\# the prefix is placed; that spelling needs pkg-config 0.29+ or pkgconf.
+        \\prefix=${{pcfiledir}}/../..
+        \\exec_prefix=${{prefix}}
+        \\includedir=${{prefix}}/include
+        \\libdir=${{prefix}}/lib
+        \\
+        \\Name: lmdb (OpenLDAP)
+        \\Description: OpenLDAP Lightning Memory Mapped Database library
+        \\URL: https://www.openldap.org
+        \\Version: {f}
+        \\Cflags: {s}
+        \\Libs: -L${{libdir}} -llmdb
+        \\{s}
+        \\
+    , .{ upstream.version, cflags, private_field }));
 }
 
 /// Keeps the two halves of the matrix honest against each other.
@@ -811,14 +1256,39 @@ fn parseTriple(b: *std.Build, triple: []const u8) std.Target.Query {
 /// `install` for one it cannot, because a cross-compiled consumer binary does
 /// not run here unless an executor was enabled for it, and a step that quietly
 /// installed instead of running is the one thing this step exists to prevent.
+///
+/// Both shape options are forwarded, because `consumer/build.zig` declares both
+/// and passes them into `b.dependency`: a consumer proof that silently built a
+/// different graph from the one it was asked to prove would prove nothing. The
+/// consumer program itself already handles the runtime shape - it calls
+/// `load(.{ .path = ... })` under `lmdb.runtime_loaded` and reports which it
+/// did (`consumer/src/main.zig:278-291`).
+///
+/// Everything else this build resolved travels with it. The target arrives as
+/// the caller's *query* plus the CPU that query names, because the nested
+/// graph runs this package's `build()` again as a path dependency and resolves
+/// both from its own options; so does the system-integration choice, in the
+/// spelling the runner knows and in both of its values. Then the executor
+/// switches, both cache directories, the install prefix, the job width and
+/// summary every `zig build` entry in this workspace is run with, and the
+/// caller's own trailing `--` arguments. An argument left behind would not be
+/// a smaller proof, it would be a proof of a configuration nobody asked for.
 fn runConsumer(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    linkage: std.builtin.LinkMode,
+    runtime_loaded: bool,
+    use_system: bool,
+    scratch: ?[]const u8,
+    provider: ?[]const u8,
 ) *std.Build.Step.Run {
     const query = target.query;
+    // `addArg` copies each argument, so these temporaries can go right after.
     const triple = query.zigTriple(b.allocator) catch @panic("OOM");
     defer b.allocator.free(triple);
+    const cpu = query.serializeCpuAlloc(b.allocator) catch @panic("OOM");
+    defer b.allocator.free(cpu);
 
     // `b.graph.zig_exe` is the compiler running this build script, so the
     // nested build is the same toolchain rather than whatever is on PATH.
@@ -827,7 +1297,41 @@ fn runConsumer(
     run.setCwd(b.path("consumer"));
     run.addArg(if (hostCanExecute(b, target)) "run" else "install");
     run.addArg(b.fmt("-Dtarget={s}", .{triple}));
+    // The CPU model and its feature set, which the triple does not carry:
+    // `Query.zigTriple` spells arch, OS, versions and ABI, and `cpu` is a
+    // separate standard option (`lib/std/Build.zig:1479-1483`). Written
+    // unconditionally, in the same shape `std.Build` itself hands a
+    // `ResolvedTarget` to a dependency (`lib/std/Build.zig:451-461`), so the
+    // nested graph compiles the consumer this graph would have compiled.
+    run.addArg(b.fmt("-Dcpu={s}", .{cpu}));
     run.addArg(b.fmt("-Doptimize={s}", .{@tagName(optimize)}));
+    // The two options the consumer package declares for itself and hands to
+    // `b.dependency`, spelled the way the build system spells them so that the
+    // nested graph is the one this graph is. Forwarded unconditionally rather
+    // than only when set: a nested build that resolved its own defaults could
+    // prove a configuration nobody asked for.
+    run.addArg(b.fmt("-Dlinkage={s}", .{@tagName(linkage)}));
+    run.addArg(b.fmt("-Druntime={}", .{runtime_loaded}));
+    // The system-integration choice, in the spelling the build runner knows
+    // (`lib/compiler/build_runner.zig:1579-1580`) and in both of its values
+    // rather than only the true one. `b.systemIntegrationOption` has already
+    // resolved it to the answer this build acted on
+    // (`lib/std/Build.zig:2726-2753`); the nested graph resolves it again from
+    // its own runner record, and with no argument that record holds nothing, so
+    // the nested graph falls back to its own default - bundled sources. What is
+    // left is a step that reads as `zig build consumer -fsys=lmdb` and proves a
+    // consumer compiled against this repository's copy rather than the
+    // installed library the outer graph was configured with.
+    run.addArg(if (use_system) "-fsys=lmdb" else "-fno-sys=lmdb");
+    // The two values the consumer *program* needs, handed to the nested build
+    // because a build script cannot reach a program's own arguments except
+    // through one. They are passed only when given: the program reads
+    // `LMDB_TEST_SCRATCH` and `LMDB_TEST_PROVIDER` as alternatives, refuses to
+    // invent a database location, never consults `TMPDIR` and never touches
+    // `/tmp` or the source tree, so a value invented here would be a database
+    // the caller never agreed to.
+    if (scratch) |dir| run.addArg(b.fmt("-Dscratch={s}", .{dir}));
+    if (provider) |path| run.addArg(b.fmt("-Dprovider={s}", .{path}));
     // The executor switches this build resolved, so the nested build runs under
     // the same one `hostCanExecute` decided with: `-fwasmtime` is how a WASI
     // consumer executes here, and `--libc-runtimes` is the QEMU integration's
@@ -838,6 +1342,19 @@ fn runConsumer(
     if (b.enable_wasmtime) run.addArg("-fwasmtime");
     if (b.enable_wine) run.addArg("-fwine");
     if (b.libc_runtimes_dir) |runtimes| run.addArgs(&.{ "--libc-runtimes", runtimes });
+    // The job width and the summary this workspace runs every `zig build`
+    // entry with (`AGENTS.md`, verification interface). The runner reads `-j`
+    // from its own argv and from nowhere else
+    // (`lib/compiler/build_runner.zig:422-427`), and nothing can append one to
+    // a `Run` step's command, so a nested build left without it derives its
+    // own width - and the consumer this step proves then compiles at a
+    // different width from the build that asked for it, and at a different
+    // width again on whichever machine runs the gate. `--summary all` is two
+    // tokens because the runner takes the mode as the next argument
+    // (`lib/compiler/build_runner.zig:262-265`), and `all` is what prints the
+    // steps this proof is made of rather than only the failures.
+    run.addArg("-j8");
+    run.addArgs(&.{ "--summary", "all" });
     // A null `path` means "the current directory", and the working directory is
     // already the consumer package, so the default is right. Two arguments,
     // not one `--cache-dir=...`: that is the form the build system emits to
@@ -845,6 +1362,54 @@ fn runConsumer(
     if (b.cache_root.path) |cache| {
         run.addArg("--cache-dir");
         run.addArg(b.fmt("{s}/consumer", .{cache}));
+    }
+    // The global cache is inherited whole rather than given a subdirectory of
+    // its own: it is the store the compiler resolves packages from, beside the
+    // pinned lib directory (`lib/std/Build.zig:122-123`), so the nested build
+    // has to resolve the one this build was given rather than one of its own.
+    // Two arguments, the spelling the runner documents
+    // (`lib/compiler/build_runner.zig:1675`) and the shape the build system
+    // itself uses when it invokes the compiler
+    // (`lib/std/Build/Step/Compile.zig:1478-1479`). Without the argument, a
+    // caller who selected a global cache on this build's command line finds the
+    // nested build resolving one of its own somewhere else.
+    //
+    // There is no guard on the path and no default for it, because that runner
+    // builds the directory with its path set unconditionally
+    // (`lib/compiler/build_runner.zig:73-76`, assigned to the graph at `:89`).
+    // A null would mean this build was not started by that runner, and a
+    // directory invented here would be a cache nobody selected - so the build
+    // stops and says so instead.
+    run.addArg("--global-cache-dir");
+    run.addArg(b.graph.global_cache_root.path orelse
+        @panic("build.zig: no global cache directory was set by the build runner"));
+    // The install prefix this invocation resolved, handed on when the caller
+    // named one. Left to its own resolution, the nested build installs into
+    // `consumer/zig-out`: a build artefact inside a source package, rather than
+    // the directory the caller asked for. A relative `--prefix` would resolve
+    // against the working directory set above, `consumer/`, and not against
+    // this build's root, so it is made absolute before it is handed on.
+    // `DESTDIR` needs no forwarding, because the nested build inherits the
+    // environment this one ran with.
+    const default_prefix = b.build_root.join(b.allocator, &.{"zig-out"}) catch @panic("OOM");
+    if (!std.mem.eql(u8, b.install_prefix, default_prefix)) {
+        const prefix = if (std.fs.path.isAbsolute(b.install_prefix))
+            b.install_prefix
+        else
+            b.pathJoin(&.{ b.graph.cache.cwd, b.install_prefix });
+        run.addArg("--prefix");
+        run.addArg(prefix);
+    }
+    // The caller's own arguments, last and behind `--`, which is where
+    // `consumer/build.zig:94` already picks them up and hands them to the
+    // program. `-Dscratch` and `-Dprovider` above are the same two values
+    // spelled as build options, and the program reads both spellings out of the
+    // same argv (`consumer/src/main.zig:218`, `:245`), so a caller who wrote
+    // `zig build consumer -- --scratch <dir>` reaches the program this step
+    // runs rather than a nested build that never heard of the argument.
+    if (b.args) |args| {
+        run.addArg("--");
+        run.addArgs(args);
     }
     // The nested build is the step's only observable effect.
     run.has_side_effects = true;
@@ -922,12 +1487,52 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
     const use_system = b.systemIntegrationOption(pkg_config_name, .{});
 
+    // Whether the facade reaches the native library through a link line or
+    // through a table an explicit `load` fills. Default false, so every command
+    // that exists today produces exactly the graph it produced before this
+    // option did. Orthogonal to `-Dlinkage`: the artifact is built and
+    // installed either way, and nothing in this file reads one to decide the
+    // other.
+    const runtime_loaded = b.option(
+        bool,
+        "runtime",
+        "Resolve the native entry points at run time instead of linking them. The facade keeps the same translated header and the same public types; each selected native function becomes a call through a table an explicit load(source) fills. The library is still built and installed; a caller may name either the provider this build produced or a compatible one",
+    ) orelse false;
+
+    // Which of upstream's two forms of the library to build. Static is the
+    // default and is what this package has always delivered, so every command
+    // that exists today still produces the artifact it produced before this
+    // option did; the spelling is the enum's own (`-Dlinkage=static`,
+    // `-Dlinkage=dynamic`), the same option name spglib and pcre2 use for
+    // their own libraries.
+    const linkage_option = b.option(
+        std.builtin.LinkMode,
+        "linkage",
+        "Build the LMDB artifact as a static archive (default) or as a shared library; named, it is also the preference -fsys=lmdb binds an installed liblmdb with",
+    );
+    const linkage = linkage_option orelse .static;
+
+    // Two defaults, and the difference is deliberate rather than subtle. The
+    // artifact this package builds is static unless asked otherwise; the
+    // installed library `-fsys=lmdb` binds to is whatever the platform prefers
+    // unless asked otherwise, which `Module.linkSystemLibrary` already makes
+    // the shared one. An unqualified system build therefore changes nothing.
+    const system_linkage = linkage_option orelse .dynamic;
+
     // build.zig.zon must not drift away from the release this build pins.
     const package_version = std.SemanticVersion.parse(manifest.version) catch {
         @panic("build.zig.zon: .version is not a semantic version");
     };
     if (package_version.order(upstream.version) != .eq) {
         @panic("build.zig.zon .version no longer matches the pinned upstream release");
+    }
+
+    // The shared object this build produces has to sit in the ABI series
+    // upstream's own soname names, and Zig takes that series from the major
+    // component of the version above. A release that moved the soname fails
+    // here rather than shipping a library another tool's loader would not bind.
+    if (upstream.version.major != upstream.soname_major) {
+        @panic("lmdb: the pinned release's major version no longer matches liblmdb/Makefile's LIBVER");
     }
 
     // Every matrix row, supported or refused, is re-derived here before
@@ -942,11 +1547,21 @@ pub fn build(b: *std.Build) !void {
     const graph = try addLmdb(b, .{
         .target = target,
         .optimize = optimize,
+        .linkage = linkage,
+        .runtime_loaded = runtime_loaded,
+        .system_linkage = system_linkage,
         .use_system = use_system,
         .register_module = true,
     });
 
     if (graph.artifact) |artifact| {
+        // The same decision `addLmdb` just made for the core, bound here
+        // because the installed tools are compiled with it too - and bound in
+        // this branch rather than above it, since in `-fsys=lmdb` mode this
+        // whole block is not reached and nothing below needs it.
+        const backend = lockBackend(target.result.os.tag) orelse
+            return refuseTarget(b, target);
+
         b.installArtifact(artifact);
         // Installing the header also puts it on the include path of anything
         // that links this artifact, so a dependent that wants the C API does
@@ -954,21 +1569,103 @@ pub fn build(b: *std.Build) !void {
         // only header upstream installs (`IHDRS = lmdb.h`,
         // liblmdb/Makefile:49); midl.h stays internal.
         artifact.installHeader(b.path(upstream.source_dir ++ "/lmdb.h"), "lmdb.h");
+
+        // The link metadata this variant needs, generated rather than copied:
+        // `pkgConfigFile` says what separates the two variants and why.
+        // `addInstallFile` creates the step without attaching it to the install
+        // step (`lib/std/Build/Step/InstallFile.zig:15-36`), so the dependency
+        // is declared here rather than assumed; `b.installFile` below is the
+        // form that attaches it.
+        const pkg_config_install = b.addInstallFile(
+            pkgConfigFile(b, target, linkage),
+            "lib/pkgconfig/lmdb.pc",
+        );
+        b.getInstallStep().dependOn(&pkg_config_install.step);
+
+        // Upstream's installed tool set - `IPROGS`, liblmdb/Makefile:52 - each
+        // one built from the sources in this repository and linked against the
+        // artifact above; `installed_tools` says why that is the same
+        // arrangement upstream uses, and what it means under
+        // `-Dlinkage=dynamic`. Its manual page is installed beside it, as
+        // `IDOCS` (:53) is at :78. The tools are not in `check` and not in the
+        // six-target matrix: they are the delivery, and this is where the
+        // delivery is built.
+        for (installed_tools) |tool| {
+            const tool_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                // Off for the same reason, and with the same reading, as it is
+                // for the core module above.
+                .sanitize_c = .off,
+            });
+            tool_module.addIncludePath(b.path(upstream.source_dir));
+            for (backend.macros) |macro| tool_module.addCMacro(macro.name, macro.value);
+            tool_module.addCSourceFiles(.{
+                .root = b.path(upstream.source_dir),
+                .files = &.{tool.source},
+                // No `-fPIC` whatever the linkage is: an executable is not a
+                // shared object, and upstream's own tool rules add nothing to
+                // theirs either (liblmdb/Makefile:141-145).
+                .flags = &c_flags,
+            });
+            tool_module.linkLibrary(artifact);
+            // Zig has already put an rpath to the library's place in the build
+            // cache on this executable, which is what lets it be run out of the
+            // cache. This one is what lets the installed copy find the
+            // installed library once the cache is gone.
+            if (installedRPath(target.result.os.tag)) |rpath| tool_module.addRPathSpecial(rpath);
+            b.installArtifact(b.addExecutable(.{
+                .name = tool.name,
+                .root_module = tool_module,
+            }));
+            b.installFile(
+                b.fmt("{s}/{s}", .{ upstream.source_dir, tool.man_page }),
+                b.fmt("share/man/man1/{s}", .{tool.man_page}),
+            );
+        }
+
+        // The terms that have to travel with a redistributed LMDB, byte for
+        // byte out of the pinned tree: the OpenLDAP Public License v2.8 text
+        // upstream ships as `LICENSE` and its own `COPYRIGHT` notice.
+        // Upstream's install rule copies neither
+        // (liblmdb/Makefile:65-78), which is a gap in upstream's install and
+        // not an exemption: whoever receives the library still needs them.
+        for (licence_files) |file| {
+            b.installFile(b.fmt("{s}/{s}", .{ upstream.source_dir, file }), b.fmt("share/lmdb/{s}", .{file}));
+        }
+
+        // And the fork's own half of the same obligation, in the same directory.
+        for (provenance_files) |file| {
+            b.installFile(file, b.fmt("share/lmdb/{s}", .{file}));
+        }
+
+        // And the same obligation again at `share/licenses/lmdb/`, which is
+        // where a package's terms are looked for by name and where the rest of
+        // this workspace installs them. `share/lmdb/` above keeps every one of
+        // these paths, so this adds the licence location rather than moving
+        // the existing one.
+        installLicenceRecords(b);
     }
 
     // `zig build` compiles the smoke program but does not run it: it is the
-    // cheapest proof that the facade, the translated header and the archive
+    // cheapest proof that the facade, the translated header and the library
     // agree on types, symbols and link-time dependencies, and a build that
     // executed a database would leave files behind.
+    // Installed beside the library, so the shared variant needs the same rpath
+    // an installed tool needs. In the static variant it is an unused entry and
+    // nothing else changes.
+    const smoke_module = b.createModule(.{
+        .root_source_file = b.path(smoke_root),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = module_name, .module = graph.module }},
+    });
+    if (installedRPath(target.result.os.tag)) |rpath| smoke_module.addRPathSpecial(rpath);
     const smoke = b.addExecutable(.{
         .name = "lmdb-smoke",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path(smoke_root),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{.{ .name = module_name, .module = graph.module }},
-        }),
+        .root_module = smoke_module,
     });
     b.getInstallStep().dependOn(&smoke.step);
 
@@ -1010,10 +1707,10 @@ pub fn build(b: *std.Build) !void {
         "Compile the C core, the facade, the tests, the smoke program and the interoperability program for the target matrix without running them",
     );
     if (!target.query.isNative()) {
-        try addTargetCheck(b, check_step, target.query, optimize);
+        try addTargetCheck(b, check_step, target.query, optimize, linkage, runtime_loaded);
     } else {
         for (supported_check_targets) |triple| {
-            try addTargetCheck(b, check_step, parseTriple(b, triple), optimize);
+            try addTargetCheck(b, check_step, parseTriple(b, triple), optimize, linkage, runtime_loaded);
         }
     }
 
@@ -1029,15 +1726,45 @@ pub fn build(b: *std.Build) !void {
         "interop",
         "Build upstream mdb_dump and compare its -p output with the fixture, byte for byte",
     );
-    try addInterop(b, interop_step, target, optimize);
+    try addInterop(b, interop_step, target, optimize, linkage, runtime_loaded);
 
     // The consumer package is not part of the matrix: it is its own `zig
     // build`, run from inside consumer/. This step is that same proof driven
     // from here, so a consumer can be built or run for a target chosen on the
     // command line without changing directory.
+
+    // Where the consumer program may put its one scratch environment, and which
+    // provider a runtime-loaded consumer should open. Both exist because the
+    // program requires them to be named: `consumer/src/main.zig` creates a
+    // randomly named child of `--scratch` and removes that child and nothing
+    // else, and under `-Druntime` it opens the `--provider` shared object before
+    // anything else. Neither has a default here either - the program's own
+    // message names what is missing, which is a better error than a directory
+    // this file made up. A run therefore needs `-Dscratch=<dir>`, or
+    // `LMDB_TEST_SCRATCH` in its environment, and under `-Druntime` a provider
+    // named the same way.
+    const scratch = b.option(
+        []const u8,
+        "scratch",
+        "Directory the consumer program may create its one scratch database under; passed to it as --scratch <dir>. Ignored by every step but `consumer`",
+    );
+    const provider = b.option(
+        []const u8,
+        "provider",
+        "Shared object a runtime-loaded consumer program should open, passed to it as --provider <path>. Needed only with -Druntime, and only by the `consumer` step",
+    );
     const consumer_step = b.step(
         "consumer",
         "Build the consumer package in consumer/ against dep.module(\"lmdb\"), and run it when this host can execute the selected target",
     );
-    consumer_step.dependOn(&runConsumer(b, target, optimize).step);
+    consumer_step.dependOn(&runConsumer(
+        b,
+        target,
+        optimize,
+        linkage,
+        runtime_loaded,
+        use_system,
+        scratch,
+        provider,
+    ).step);
 }

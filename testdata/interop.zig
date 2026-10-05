@@ -48,6 +48,15 @@
 //! `zig build check` compiles this program for every target of the matrix and
 //! never runs it there: a reference binary for a foreign target would have to
 //! be a foreign binary, and running one is not what that step claims to do.
+//!
+//! ## The one configuration difference
+//!
+//! In a runtime-loading build (`-Druntime=true`) the module reaches liblmdb
+//! through a table that `lmdb.load` fills, so `--provider <path>` names the
+//! shared object to open, or `LMDB_TEST_PROVIDER` does when the flag is absent.
+//! Both are explicit and nothing else is tried; a build that was not told which
+//! file to open says so instead of loading something. A linked build reads
+//! neither, and the same comparison against `mdb_dump` follows.
 
 const std = @import("std");
 const lmdb = @import("lmdb");
@@ -61,6 +70,50 @@ const data_end = "DATA=END\n";
 
 const arg_dump_prefix = "--dump=";
 const arg_dir_prefix = "--dir=";
+
+/// A shared object exporting the `mdb_*` entry points of
+/// `libraries/liblmdb/lmdb.h`, named by the environment in a runtime-loading
+/// build.
+const provider_variable = "LMDB_TEST_PROVIDER";
+
+/// A runtime-loading build has no provider until one is named. The allocator's
+/// own failure is in the set because reading the command line and the
+/// environment allocates, and an out-of-memory is not the same as "nobody said
+/// which file to open".
+const ConfigurationError = error{NoProviderConfigured} || std.mem.Allocator.Error;
+
+/// The provider this run should load, from `--provider <path>` or from
+/// `LMDB_TEST_PROVIDER`.
+///
+/// Both are explicit. Nothing here looks in a default location or falls back to
+/// a linked copy: a runtime-loading build that was not told which file to load
+/// reports that it was not told, rather than loading something else.
+fn providerRequest(init: std.process.Init) ConfigurationError![]const u8 {
+    const arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(arena);
+    // `args[0]` is this program's own path.
+    var index: usize = if (args.len == 0) 0 else 1;
+    while (index < args.len) : (index += 1) {
+        if (std.mem.eql(u8, args[index], "--provider")) {
+            if (index + 1 >= args.len) return noProvider();
+            return args[index + 1];
+        }
+    }
+    return init.environ_map.get(provider_variable) orelse return noProvider();
+}
+
+/// Say which variable is missing. An error name on its own would send the next
+/// person into the loader instead of to the command line.
+fn noProvider() ConfigurationError {
+    std.debug.print(
+        "interop: this is a runtime-loading build. Pass --provider <path>, or " ++
+            "export " ++ provider_variable ++ " with a shared object exporting " ++
+            "the mdb_* entry points of libraries/liblmdb/lmdb.h. Nothing is " ++
+            "loaded by default and no other file is tried.\n",
+        .{},
+    );
+    return error.NoProviderConfigured;
+}
 
 const corpus_text = @embedFile("corpus.txt");
 
@@ -99,6 +152,16 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &stdout_buffer);
     const out = &stdout.interface;
+
+    // In a runtime-loading build nothing below can run until a provider is
+    // loaded, and the load is the one explicit step the contract asks for. In a
+    // linked build this is a no-op at comptime and the module is already
+    // usable. The reference tool is a separate program with its own linkage, so
+    // it is unaffected either way — which is exactly what makes the comparison
+    // an interoperability check rather than a round trip.
+    if (comptime lmdb.runtime_loaded) {
+        try lmdb.load(.{ .path = try providerRequest(init) });
+    }
 
     const args = try init.minimal.args.toSlice(arena);
     const options = try parseArgs(arena, args);
@@ -157,13 +220,24 @@ fn compare(
 }
 
 /// Read the command line. `--dump` is required; `--dir` is not.
+///
+/// `--provider <path>` is accepted and skipped here: it is read by
+/// `providerRequest` above, and a runtime-loading run that passed it must not
+/// be rejected for having passed it.
 fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) !Options {
     var dump: ?[]const u8 = null;
     var dir: ?[:0]const u8 = null;
     // `args[0]` is this program's own path.
     const tail = if (args.len == 0) args else args[1..];
 
-    for (tail) |arg| {
+    var index: usize = 0;
+    while (index < tail.len) : (index += 1) {
+        const arg = tail[index];
+        if (std.mem.eql(u8, arg, "--provider")) {
+            index += 1;
+            if (index >= tail.len) return error.BadArguments;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, arg_dump_prefix)) {
             dump = arg[arg_dump_prefix.len..];
         } else if (std.mem.startsWith(u8, arg, arg_dir_prefix)) {

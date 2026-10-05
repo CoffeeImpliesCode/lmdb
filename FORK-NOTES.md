@@ -277,10 +277,16 @@ the expectation did not. `CHANGELOG.md` entries 21 and 22 carry the receipts.
 
 ### 9. Scratch goes where the process was started
 
-**Decision.** All four scratch-creating programs read the temporary root at
-runtime — `TMPDIR`, and on Windows `TEMP` then `TMP` — create **one** directory
-named from 12 random bytes in base64url under it, and delete **only that
-directory**.
+**Decision.** The three in-package scratch-creating programs — `tests.zig`,
+`smoke.zig` and `testdata/interop.zig` — read the temporary root at runtime
+(`TMPDIR`, and on Windows `TEMP` then `TMP`), create **one** directory named
+from 12 random bytes in base64url under it, and delete **only that directory**.
+
+**Superseded for the fourth, on 2026-10-04.** `consumer/src/main.zig` no longer
+takes the temporary root at all. It takes `--scratch <dir>` or
+`LMDB_TEST_SCRATCH`, refuses `TMPDIR`, never touches `/tmp`, writes nothing
+into the source tree, and exits non-zero when neither is given
+(`consumer/src/main.zig:236-261`). That is decision 15.
 
 **Why `std.testing.tmpDir` is not used.** It puts its directory under the
 **working directory** whatever the environment says. A host policy that keeps
@@ -542,8 +548,8 @@ handling.
 
 ### 14. The two steps that must execute now ask the executor `Run` asks, not `Query.isNative()`
 
-**Decision.** `interop` and `consumer` share one predicate, `hostCanExecute`
-(`build.zig:883-918`), and that predicate is
+**Decision.** `interop` and `consumer` share one predicate, `hostCanExecute` (the
+`fn hostCanExecute` body in `build.zig`), and that predicate is
 `std.zig.system.getExternalExecutor` — the same call `std.Build.Step.Run` makes
 about the artifact it is about to spawn (`lib/std/Build/Step/Run.zig:1268-1271`).
 The two options `Run` derives from the artifact are filled here from this
@@ -554,12 +560,12 @@ when a libc-runtimes directory was supplied. The four executor switches
 `std.Build` exposes from the build runner (`b.enable_darling`, `.qemu`,
 `.wasmtime`, `.wine`) are passed through, because each names a separate program
 whose presence on `PATH` a build script cannot know. The result is mapped once:
-`.native, .rosetta => true` (`build.zig:895`),
-`.qemu => !candidate.isGnuLibC() or b.libc_runtimes_dir != null` (`:910`),
-`.wine, .wasmtime, .darling => true` (`:913`),
-`.bad_dl, .bad_os_or_cpu => false` (`:916`). The call sites are `build.zig:748`,
-where `addInterop` returns before wiring the comparison, and `build.zig:828`,
-where `runConsumer` passes `run` or `install` to the nested build.
+`.native, .rosetta => true`, `.qemu => !candidate.isGnuLibC() or
+b.libc_runtimes_dir != null`, `.wine, .wasmtime, .darling => true`,
+`.bad_dl, .bad_os_or_cpu => false`, each in that one `switch`. The call sites are
+the two `hostCanExecute(b, target)` calls in `build.zig`: the one in `addInterop`,
+which returns before wiring the comparison, and the one in `runConsumer`, which
+passes `run` or `install` to the nested build.
 
 **Why the old predicate could not answer the question.** `Target.Query.isNative()`
 describes **how the target was written**, not what the host can execute:
@@ -632,13 +638,89 @@ asked `hostCanExecute` about a foreign GNU-libc target with `-fqemu` and no
 `--libc-runtimes`. The argument for it is `SOURCE-CONFIRMED` against the pinned
 compiler's own `lib/std`, cited above, and the behaviour is
 `PENDING-VERIFICATION`. The 53-cell matrix, the six-target `check` baseline, the
-native Debug/ReleaseSafe/consumer gates, `zig build interop` on the default
+native Debug and ReleaseSafe gates, `zig build interop` on the default
 native selection, the installed-C surface, `sha256sum -c UPSTREAM.sha256` and
-the package round all remain the parent's, over this tree.
+the package round all remain the parent's, over this tree. The consumer step has
+since run over this tree, in nine cases from a cross-SDK nested-route driver:
+eight green route cases across linkage, runtime-loaded shape and explicit target,
+and one that exited 1 with `error: NoProviderConfigured`, which is the refusal
+that case exists to require. The `.qemu` claim this entry makes is not among
+them.
 
 **Target bound.** Zig 0.16.0's `lib/std` as this package pins it, for any fork
 whose gate decides between *running* and *installing* — or between comparing and
 not — with a predicate of its own. The general form is L21.
+
+### 15. A program that refuses to invent its environment location makes every caller name one
+
+**Decision.** `consumer/src/main.zig` reads `--scratch <dir>` or
+`LMDB_TEST_SCRATCH`, and under `-Druntime` reads `--provider <path>` or
+`LMDB_TEST_PROVIDER`. Neither has a default, neither has a fallback, and a run
+with neither exits non-zero after printing what it is missing
+(`consumer/src/main.zig:210-261`). The `scratch` and `provider` options in
+`build.zig` and `consumer/build.zig:52-61` declare the build-level spellings and
+pass them through when given (the two conditional argument blocks in
+`runConsumer` and `consumer/build.zig`'s `run_exe`), and
+CI `consumer` job exports the variable to a directory it creates under the
+runner's own temp.
+
+**Why the devenv task names one too.** It is a caller like any other: a bare
+`zig build consumer` inside `devenv.nix`'s `lmdb:consumer` would hit the same
+refusal. It now takes the caller's `LMDB_TEST_SCRATCH` when one is exported and
+otherwise makes a fresh `mktemp -d` **inside the `TMPDIR` the caller exported**,
+printing the path. Two boundaries hold there: scratch placement stays the host's
+policy — never `/tmp`, never the checkout, never a default invented in a Nix
+file — and nothing is swept afterwards, because the program already deletes the
+one random child it made and a cleanup trap in a task file can reach things the
+task does not own. With neither variable exported it exits non-zero naming what
+is missing.
+
+**Why the consumer is stricter than decision 9.** The three in-package programs
+are given a working environment by whoever starts them and can read the
+temporary root it names. The consumer is a package that did not write this
+library, and its database location is the one thing a caller must be able to
+account for: a program that picked `/tmp` for itself would put an LMDB data file
+where nobody agreed to one, and a program that picked the checkout would put it
+in a repository. A refusal that names what is missing is a better answer than
+either.
+
+**Why the parent forwards rather than defaults.** `build.zig` forwards
+`-Dscratch`/`-Dprovider` only when they were given (the two conditional
+`run.addArg` calls in `runConsumer`).
+Inventing one here would put a database in a place the caller never named, which
+is exactly what the program refuses to do — and the build script's own message
+would then contradict the program's. It forwards `-Dlinkage` and `-Druntime`
+**unconditionally** (the `-Dlinkage` and `-Druntime` `run.addArg` calls) for the
+opposite reason: those name which
+graph is being proved, and a nested build that resolved its own default would
+prove a configuration nobody asked for.
+
+**Why the CI step names a runner-owned directory.** `RUNNER_TEMP` is the job's
+own directory inside the runner workspace — not `/tmp`, not the checkout, and
+holding nothing this gate did not put there. The `mkdir -p` states the location
+the run is about to use; it does not substitute for the program's own
+bookkeeping, which still creates exactly one randomly named child inside it and
+removes that child and nothing else (`consumer/src/main.zig:167-205`).
+
+**A failed load is a failure.** The consumer calls `lmdb.load(.{ .path = … })`
+before anything else and propagates the error (`consumer/src/main.zig:289-291`),
+and the loader refuses a relative `.path` outright
+(`runtime/loader.zig:185-196`). Nothing in this package adds
+`continue-on-error`, `|| true` or a second candidate to paper over either.
+
+**Cost, honestly.** Two options and two environment variables that a caller must
+know about, and three historical consumer receipts whose recorded commands do
+not reproduce on the current tree. Those receipts keep their observations; each
+row in `README.zig.md`'s gate table now carries the caveat. The three shapes
+were `PENDING-VERIFICATION` when this entry was written; a cross-SDK nested-route
+driver has since run them, and the gate table row records that evidence with what
+it does not reach.
+
+**Target bound.** Any program that refuses to invent a location for itself, and
+any gate — CI or otherwise — that runs one.
+
+**Still unexercised.** `-fsys=lmdb` has still not been run, and the workflow has
+still never met a runner.
 
 ## Lessons
 
@@ -822,6 +904,14 @@ that child on every exit path.
 
 **Target bound.** Zig 0.16.0's `std.testing.tmpDir`; any library that requires
 its directory to pre-exist (`mdb.c` contains no `mkdir`).
+
+**Sharpened on 2026-10-04, by an out-of-tree consumer.** This fix is right for a
+program the caller starts, because the caller has already decided where scratch
+goes. It is **not** enough for a program that a caller runs without configuring:
+such a program has to be told, and told by every route it can be reached through
+— its own arguments, its own environment variables, its build options, the
+documented commands, and the CI step that runs it. `consumer/src/main.zig` reads
+only `--scratch`/`LMDB_TEST_SCRATCH`; see L26.
 
 ### L11 — A CLI-visible refusal belongs in CI, asserted, with its reason
 
@@ -1147,9 +1237,10 @@ the same answer.
   consumer package spawned as its own nested `zig build`, or an interoperability
   comparison between two programs the build just made — and that step has to
   decide, for the target it was handed, whether to run the thing or to build it
-  and stop. Here: `build.zig:828`, `run.addArg(if (…) "run" else "install")`, and
-  `build.zig:748`, `if (!hostCanExecute(b, target)) return;`. The natural
-  predicate is `Target.Query.isNative()`, and it is the wrong one.
+  and stop. Here: `runConsumer`'s `run.addArg(if (hostCanExecute(b, target))
+  "run" else "install")`, and `addInterop`'s `if (!hostCanExecute(b, target))
+  return;`. The natural predicate is `Target.Query.isNative()`, and it is the
+  wrong one.
 * **Symptom.** The gate reports success while executing nothing, and it does so
   *loudest exactly where it matters most*. `Query.isNative()` is
   `isNativeTriple() and ofmt == null` (`lib/std/Target/Query.zig:396-398`) over
@@ -1177,7 +1268,8 @@ the same answer.
   (`Run.zig:1290-1314`, `:1310`). A foreign **GNU**-libc target under QEMU with
   no directory is a failure, so the gate must answer *no*, which is a second test
   on the returned executor and not a reading of the option. Forward the executor
-  switches to the nested build too (`build.zig:835-840`), or the nested build
+  switches to the nested build too (the `runConsumer` block that forwards the
+  executor switches), or the nested build
   runs under a different executor than the one the decision was made with.
 * **Targets bound.** Zig 0.16.0's `lib/std` as pinned, and any build script that
   decides between running and not. It is also the reason the honest default for
@@ -1191,6 +1283,247 @@ the same answer.
   step that never asked at all (`test` and `smoke`, which hand the decision to
   `Run` through `addRunArtifact`) — so the repair's blast radius is the two
   steps that asked, and no matrix cell moves with it.
+
+### L22 — "One licence, named after the project" is only answerable with a per-file record
+
+**Condition.** A vendored C tree ships a dominant licence text, and several files
+inside it carry terms of their own: a retained ISC-style grant, a public-domain
+dedication, a conditional one behind an `#ifdef`, and at least one file that
+carries no notice whatsoever.
+
+**Symptom.** Two list-shaped records answer "which files restate the
+redistribution sentence" and "why do the others not" — and neither answers "what
+governs *this* file". An auditor has to count and subtract, and the count is only
+as good as the grep that produced it. Worse, the split hides files that carry
+**some** term but not that sentence: roff man pages with a copyright line and a
+licence pointer in a comment, and files whose own year range differs from every
+other file's. Both read as "unlicensed" in a sentence-shaped record and as
+licensed in a per-file one.
+
+**Fix.** Write one row per file: the term, **the line range in that file** where
+the term is written, what the build does with it, and what an output installs. Let
+the row count equal the file count, so the list-shaped record and the table can be
+checked against each other. Name the file that carries nothing as carrying
+nothing, and do not extend its neighbour's dedication to it — assigning one file's
+terms to another by association is an interpretation, not a reading.
+
+**Targets bound.** Any vendored tree. Here: 42 rows for 42 files, 29 + 13 = 42,
+and the `#ifdef` guard deliberately named outside the range it guards, because a
+range that swallows the guard claims text the guard is not part of.
+
+### L23 — Matching an upstream licence for fork-authored code does not attribute authorship, but the text may name someone
+
+**Condition.** A project is vendored under a custom upstream licence — here
+OLDAP-2.8 — and its own packaging, facade, tests and documentation need a licence
+too. The owner authorizes one, matching the primary upstream term.
+
+**Symptom.** Two opposite failures are available and both are silent. The first is
+reaching for a generic permissive licence because it is the one this repository
+already uses elsewhere: it puts two different warranty disclaimers in one
+distribution, invites the reader to conclude they cover different files, and
+implies a grant on the compiled core that upstream never made. The second is
+worse and subtler — **the upstream licence's own warranty paragraph names the
+upstream foundation**, so applying it to fork-authored files puts a sentence
+asserting a provider and a liability limitation in a package whose packaging that
+foundation never wrote. Skipping over that feels like respecting the licence; it
+is quietly asserting authorship.
+
+**Fix.** Match the primary upstream term, and then state the mismatch in terms.
+Record that the disclaimer travels as part of a fixed document the fork is
+required to reproduce verbatim, and that it is **not** an authorship statement.
+Name the clauses that constrain the fork's use of the names inside it — the
+no-promotion clause and the trademark clause — and record that the fork uses them
+only to satisfy attribution and to identify whose work it is. Say plainly that no
+personal copyright identity is invented and that the grant is of permission, not
+title. Verify the SPDX short identifier against a primary source rather than from
+memory: here `lib/licenses/licenses.nix:1318-1321` in the pinned nixpkgs defines
+`lib.licenses.openldap` with `spdxId = "OLDAP-2.8"`, which is an independent
+confirmation of the identifier and of the attribute name the packaging uses.
+
+**Targets bound.** Any fork under a custom or named-permissive upstream licence —
+Zlib, Apache-2.0, OLDAP, MPL, BSL — and any package whose two halves are authored
+by different people. The one that never applies: a fork that adds a grant over its
+own files *and* thereby acquires a new binary-redistribution obligation it did not
+have before. That obligation is real, so record it and check the delivery paths
+that satisfy it, rather than letting a previously unlicensed file stay invisible.
+
+### L24 — A loader dependency in one compiled unit needs a different answer per linkage variant
+
+**Condition.** An archive contains a unit that calls the platform's dynamic loader
+(`module.c` and `dlopen`/`dlsym`/`dlerror`/`dlclose`, here), and the package now
+ships both a static archive and a shared object.
+
+**Symptom.** Upstream's own pkg-config template puts everything on one line —
+`Libs: -llmdb -ldl -pthread`. That is right for its shared library, where `-ldl`
+is on the link line of the `.so` itself (`Makefile:92`), and **wrong** for a static
+consumer who gets flags they do not need, while a generated `.pc` with no
+`Libs.private` at all is worse for the static case: the consumer's link fails on an
+unresolved `dlopen` with nothing in the metadata to explain it.
+
+**Fix.** `Libs: -L${libdir} -llmdb` in both variants. `Libs.private` carries the
+loader dependency **in the static variant only**, because `pkg-config` emits
+`Libs.private` only under `--static`, which is exactly the consumer who needs it;
+the shared variant already has the dependency as a `DT_NEEDED` entry, and
+re-adding it there is wrong rather than merely redundant. Declare the dependency
+once, on the module that owns the unit, so it reaches every link line — and say in
+the documentation that **no wholly-static closure is being claimed**, because the
+static archive's consumer still has to resolve `dlopen`.
+
+**Targets bound.** ELF, where the dependency is `-ldl` (`Makefile:31`, the
+Makefile's own `LDL`) and `-pthread`; COFF, where it is `kernel32` because the unit
+takes the `LoadLibrary`/`GetProcAddress`/`FreeLibrary` arm; Darwin, where it is
+**empty**, because the POSIX arm's `dl*` entry points come from libSystem and a GNU-ld
+flag name does not apply. Emitting `-ldl` on Darwin would be the same error as
+leaving it out on Linux: a flag the platform has no meaning for.
+
+### L25 — A build tool's cache rpath is a dead path once the binary is installed, and not every format has a fixer
+
+**Condition.** A build graph links executables against a dynamic artifact it just
+built, and the tool appends an rpath into its own build cache so the binaries run
+in place. Those executables are then installed into a prefix.
+
+**Symptom.** Every installed binary carries a search-path entry pointing at a
+directory that does not exist after the build. It is harmless until it is not: a
+packaging hook that rewrites store paths may reject an rpath it does not recognise,
+and on Mach-O there is no `patchelf` at all, so the entry cannot simply be removed
+with the tool that removes it on ELF.
+
+**Fix.** Normalise the rpath in the packaging step, before any fixup hook runs, so
+the hook meets an rpath containing neither a cache path nor a store path: remove
+every rpath, then set `$ORIGIN/../lib` (ELF) or `@loader_path/../lib` (Darwin). Where
+the fixer does not apply, **state the residue rather than guessing at an
+invocation that has never run** — and make sure the correct entry is present by some
+other means, so the tool still resolves the installed library on that platform.
+
+**Targets bound.** ELF: `patchelf --remove-rpath` then `--set-rpath`. Mach-O:
+neither — the entry survives, and the honest record names the platform and the
+reason. Windows: not applicable, and the packaging does not pretend otherwise.
+
+### L26 — Every caller of a program that refuses to invent its own environment has to name one, including CI and the documentation
+
+* **Condition.** A program in a package takes the location of the state it must
+  create — a scratch database, a temporary file, a loaded provider — from an
+  explicit argument or an explicit environment variable, and **refuses** to
+  invent one: no `TMPDIR`, no `/tmp`, no default directory. Here,
+  `consumer/src/main.zig` takes `--scratch <dir>` or `LMDB_TEST_SCRATCH`, and
+  under a runtime-loaded build `--provider <path>` or `LMDB_TEST_PROVIDER`.
+
+* **Symptom.** The program is correct and every gate that runs it is red, or
+  silently green for the wrong reason. Two distinct failures live here. First, a
+  CI job that runs `zig build run` with no value named exits non-zero every
+  time — a gate that cannot pass, whose failure says nothing about the thing it
+  exists to prove. Second, and worse because it is invisible, a document that
+  records the command without the value reproduces neither, and a reader who
+  copies it concludes the program is broken.
+
+* **Fix.** Enumerate every route the value can arrive by and make each one say
+  so: the program's own argument, the program's environment variable, the build
+  option that forwards it (`build.zig` → nested `zig build` → `addArgs`), the
+  documented command line, **every task file that runs it**, and the CI step.
+  The build script forwards the value **only when given** — an invented default
+  there would put a database somewhere the caller never agreed to, and would
+  contradict the program's own refusal — while it forwards the *shape* options
+  (`-Dlinkage`, `-Druntime`) **unconditionally**, because those name which graph
+  is being proved. Pick a CI scratch directory the runner owns: `$RUNNER_TEMP`,
+  never `/tmp` and never the checkout. Create it in the step, so the location is
+  stated rather than implied.
+
+* **A task file is a caller too, and it has no host of its own.** A wrapper
+  script cannot invent a scratch default: scratch placement belongs to whoever
+  runs the machine. Give the wrapper the same order of preference the program
+  itself uses — the caller's own exported value first, then a fresh
+  `mktemp -d` **inside the `TMPDIR` the caller exported** — print where it put
+  it, and exit non-zero with an explanation when the caller named neither. Do
+  not add a cleanup trap: the program already deletes the one child it created,
+  and a `rm -rf` in a task file can reach paths the task does not own.
+
+* **Do not soften the refusal to make the gate green.** No `continue-on-error`,
+  no `|| true`, no `set +e`, no default provider and no fallback to a linked
+  copy. A provider that cannot be loaded is a failure, and that is the same
+  rule as L11's for a refused target: assert the failure, never tolerate it.
+
+* **Historical receipts keep their observation.** When a program gains a
+  requirement after a gate was recorded, the recorded command stops
+  reproducing. Annotate the row with the tree it describes; do not rewrite the
+  observation into a claim about the later tree, and do not silently present an
+  unrun command as an observed pass.
+
+* **Targets bound.** Any package with a runnable consumer or example program
+  that takes its own state location explicitly; any CI workflow that runs one.
+  The rule is the same as L10's with the direction reversed: L10 says a program
+  must honour the temporary root it was given, and this says that when a program
+  will not guess, every caller has to say which root it meant.
+
+### L27 — A module argument named after the tool is that tool's *input*, and a cache default belongs to the shell, not to the evaluation
+
+* **Condition.** A configuration file takes a module argument named after the
+  tool that will read it and interpolates `${tool.<option>}` from it into a
+  generated script, to name a default directory when the caller supplied none.
+
+* **Symptom.** The configuration evaluates for everything that does not force the
+  generated script and fails for everything that does, and the error names the
+  attribute rather than the argument: `error: attribute 'stateDir' missing`. Half
+  a gate table goes red from one cause, and the cause reads like a mistyped path
+  rather than a wrong namespace, so the first repair attempted is usually the
+  wrong one.
+
+* **Why the name is the trap.** These tools hand the resolved flake **inputs** to
+  every module — the generated bootstrap library evaluates with
+  `specialArgs = inputs // { inherit inputs secretspec primops; }` — so a module
+  argument called `devenv` is the pinned devenv *input*, a path and its metadata,
+  and not the `devenv.*` option namespace. The option that does exist is
+  `devenv.state`; it reaches the shell as `$DEVENV_STATE`. Read the module's own
+  argument list before trusting a name that looks like an option path.
+
+* **Fix.** Read the location out of the environment the script runs in, never out
+  of the evaluation: a value the caller exported first, then a directory the
+  host's own policy already names, and an explicit statement that nothing was
+  chosen when there is neither. Never interpolate an absolute host path into a
+  generated script — that makes the artifact a function of where it happened to be
+  evaluated, and it puts a cache inside the checkout whenever the tool's root is
+  the checkout. Drop an argument the file no longer uses rather than leaving it
+  bound to something that does not mean what its name suggests.
+
+* **Targets bound.** Any `devenv.nix` that interpolates `${devenv.<attr>}` into
+  `enterShell`, `env` or a task body; any cache default a developer's shell has to
+  have. Same rule as L10 with the direction reversed: L10 says a program must
+  honour the temporary root it was given, and this says the shell must read the
+  root it was given instead of computing one at evaluation time.
+
+### L28 — A generated task inherits the caller's directory, so the body names its own root
+
+* **Condition.** `devenv.nix`'s task bodies named `build.zig`, `consumer/` and
+  `UPSTREAM.sha256` relatively and said nothing about the working directory.
+
+* **Symptom, observed.** Acceptance run `20261004T193710Z` ran both canonical
+  routes from a scratch project directory and both reported their own scripts'
+  absence: `error: no build.zig file found, in the current directory or any
+  parent directories` from `lmdb:consumer`, and `sha256sum: UPSTREAM.sha256: No
+  such file or directory` from `lmdb:integrity`. Logs
+  `lmdb-devenv-consumer.log` and `lmdb-devenv-integrity.log`, index
+  `lmdb-index.json` of run `20261004T193710Z`.
+
+* **Fix.** `sdkRootArg = pkgs.lib.escapeShellArg (builtins.toString ./.)` and one
+  `cd … || exit 1` line open every body, including the one that only reads a
+  checksum file. `builtins.toString`, because `${./.}` copies the SDK into the
+  read-only store and the task would then verify a copy. The cache rule L27
+  stated for the shell is applied again inside the task, with the same two
+  variable names and the same two roots, because a task does not pass through
+  the hook; a task with nowhere approved to write says so and stops. The two
+  tasks that install name a prefix under the caller's local cache, because
+  `zig build`'s own default prefix is `zig-out` inside the checkout. Every
+  `zig build` carries one shared flag string — `--cache-dir "$lmdb_build_cache"
+  -j8 --summary all` — instead of a default: without the explicit cache Zig
+  writes `.zig-cache` into the working directory, which is the checkout again,
+  and one string is what keeps nine bodies from drifting apart on the same
+  three flags.
+* **Targets bound.** Any task or script body in this workspace that names a
+  repository file relatively; any command that installs without a prefix.
+  `$DEVENV_ROOT` is not the root: it is the devenv project, which holds
+  `.devenv/` and `devenv.lock` and none of the source.
+
+* **Not claimed.** No `nix`, `devenv` or `zig` command was run for this lesson;
+  the two gates are not claimed green.
 
 ## What the parent still owns
 
@@ -1211,6 +1544,13 @@ exactly, so nothing is lost between the documentation and the gates.
 | `zig build interop` and the installed-C program on the current tree | **Split, and both halves are stated.** `zig build interop` has now been observed on this tree for one target selection — the explicit `-Dtarget=x86_64-linux-gnu`, where the harness ran and printed `6 records match mdb_dump -p byte for byte` with `Build Summary: 10/10 steps succeeded` (`CHANGELOG.md` §30). The **default native selection has no receipt over this tree**, so the `7/7` and `8/8` step counts of §28 and §29 were not re-measured, and **the installed-C program has not been re-run at all**. Both have receipts only from earlier trees |
 | the foreign-GNU-under-QEMU branch of `hostCanExecute` | **Never exercised.** No build has asked `hostCanExecute` about a foreign GNU-libc target with `-fqemu` and no `--libc-runtimes`, so the arm that keeps such a target on `install` is `SOURCE-CONFIRMED` against the pinned compiler's `lib/std/zig/system.zig:95` and `lib/std/Build/Step/Run.zig:1290-1314`, and `PENDING-VERIFICATION` as behaviour |
 | the final filtered package round | The last round on record is the workspace package-regression run of 2026-10-02T12:13–12:18Z, and it did run over a later tree than the historical `foundation-expansion-…` logs: `zig fetch` printed `lmdb-1.0.1-tSeszSGFEQCKyjxN9BejhfjEWphAgfZqtC9Qbzh22EgG` with 16 `.paths` entries and 61/61 files, the 43-line record checked 43/43 in the source **and** 43/43 inside the fetched copy with the two manifests byte-identical, and the consumer inside the fetched copy exited 0. That round ran over the post-§28 tree and predates **both** of this wave's `build.zig` changes (§29 and §30), so the round over **this** wave's tree has not run and nothing is claimed for it. `UPSTREAM.sha256` itself is unaffected by either — it covers `libraries/liblmdb/` and `testdata/corpus.txt`, and neither moved |
+| this migration wave's own gates | **Never run when this row was written, and nothing here claims otherwise.** The wave added the `-Dlinkage=static\|dynamic` native delivery option, the generated `lib/pkgconfig/lmdb.pc`, four tools this build previously did not compile, the five man pages, `share/lmdb/{LICENSE,COPYRIGHT}` in the install prefix, and the `README.md` / `FORK-LICENSE.md` / `package.nix` / `flake.nix` / `flake.lock` / `devenv.nix` / `devenv.yaml` / `.envrc` set. Outstanding, gate by gate: `zig build -Dlinkage=dynamic` and a read of the installed library's **soname** out of the artifact; `nix build .#lmdb` and `nix build .#lmdb-shared` and each installed closure; `devenv shell` and the scripts in it; a C consumer resolving `-ldl` through `Libs.private` with `--static` and not needing it in the shared variant; and `sha256sum -c UPSTREAM.sha256` over this tree. Every one is a row in the gate table in `README.zig.md` marked `PENDING-VERIFICATION`. **One item has since been observed**: the three consumer shapes, in nine cases from a cross-SDK nested-route driver — eight green route cases across linkage, runtime-loaded shape and explicit target, each exit 0 with the consumer program's own agreement line, and one `-Druntime=true` case with no provider that exited 1 with `error: NoProviderConfigured`, which is the required refusal. `-fsys=lmdb` was not among those cases and is still outstanding. The soname is the one to watch: it is stated as `liblmdb.so.1` from Zig's naming rules and upstream's `SOVER`, and **no artifact has been read** |
+| the two Nix lock files | **Superseded on 2026-10-04: `flake.lock` is now in the tree and `devenv.lock` is not.** `flake.lock` records nixpkgs at `github:NixOS/nixpkgs/c7def046b9a883d46974757852106483d741586f` — the same commit `flake.nix` pins — with its `narHash` and `lastModified`, so the flake's input is resolved rather than floating. `devenv.lock` **does not exist and was not invented**: `devenv.yaml` pins `github:cachix/devenv-nixpkgs/c2f38fe7f9e04d9aadd354d380f2bd40531d9737` and creating that lock is still the parent's, because a lock records a resolution this fork has not performed. Neither file's presence says anything about whether a derivation builds — the `nix build` row above is unchanged |
+| `build.zig.zon` `.paths` and `flake.lock` | **Closed on 2026-10-04.** The manifest named `flake.nix`, `package.nix`, `devenv.nix`, `devenv.yaml` and `.envrc` but not `flake.lock`, so a package materialised through `.paths` received the flake without its resolution. `.paths` now names `flake.lock` beside the `flake.nix` it resolves, and goes from 24 entries to 25. `devenv.lock` is deliberately listed nowhere and still does not exist: a `.paths` entry naming an absent file breaks the fetch rather than resolving anything. Per `CHANGELOG.md` §26 a `.paths` change wants a fresh `zig fetch` and a fresh consumer inside the fetched copy, so **any recorded `zig fetch` identity for this package is stale** and is re-derived once from the frozen tree |
+| `lib.licenses.openldap` at the pinned nixpkgs | **Read out of the primary source, not assumed**: `lib/licenses/licenses.nix:1318-1321` in commit `c7def046b9a883d46974757852106483d741586f` defines `openldap = { spdxId = "OLDAP-2.8"; fullName = "Open LDAP Public License v2.8"; }`, and `package.nix` uses it. What is *not* observed is that a derivation using it evaluates and builds, which is the same `PENDING-VERIFICATION` as the derivations themselves |
+| the devenv task runner's spelling | **Closed on 2026-10-04, by the pinned CLI's own source and by the driver's invocations.** `devenv/src/cli.rs` at the pinned `fe20b5cba7ab5e93ae73f956a8d3efc50e1753f4` declares `Commands::Tasks { command: TasksCommand }` with `Run` and `List` beneath it and no alias, so the spelling is `devenv tasks run <name>` and `devenv tasks list`; the driver invoked both and named `lmdb:consumer` and `lmdb:integrity`. The banner's singular `devenv task` was wrong and is corrected. What the two `tasks run` gates still lack is a **green** run: in `20261004T172416Z` both died on `attribute 'stateDir' missing` before any task body ran, and in the later `20261004T193710Z` both reached their bodies and died there on the working directory instead — `no build.zig file found` and `UPSTREAM.sha256: No such file or directory`, corrected in `devenv.nix` by L28 and **not** replayed since. No `exec` body is behaviour-confirmed |
+| the canonical tasks' working directory, flags and install prefix | **Closed as source, open as behaviour.** Every body now names its own root (`builtins.toString ./.`); every `zig build` carries one shared `--cache-dir "$lmdb_build_cache" -j8 --summary all`, so no build falls back to a `.zig-cache` in the checkout and no body spells those flags on its own; and the two installing tasks carry `--prefix` under `$ZIG_LOCAL_CACHE_DIR` instead of `zig-out`. Nothing was executed for that correction and no gate has been replayed over it, so it is `SOURCE-CONFIRMED` text and `PENDING-VERIFICATION` behaviour |
+| the four source-bound runs of 2026-10-04 and 2026-10-05 | **Observed, each under its own source stamp.** `zig build check` over the declared compile targets, label `baseline-lmdb-check` in baseline run `20261005T014547Z-797a73f2`: exit 0, `Build Summary: 36/36 steps succeeded`, five targets seen, `wasm32-wasi` absent because this graph refuses it at configure time. `cross-test --jobs 8 --build-jobs 8`, run `20261004T221720228710Z-45046`, receipt `lmdb-53-target-8.json`, source stamp `208a5547821d…` identical before and after: exit 1, **1 pass, 32 build-only, 1 build failure, 19 run failures**, 20 cells executed at 38 tests each. Native final wave `20261004T233628757747Z-69351`: 8 of 8 `exit 0`, each `46/46 steps` and `38/38 tests`. Own-loaded wave `20261004T232823091897Z-23133`: 8 of 8 `pass`, each `48/48 steps` and `38/38 tests`. **What these four do not do:** promote any gate in the rows above. `zig build interop` on the default native selection, the installed-C program, the whole-record `sha256sum -c`, the filtered fetch with its consumer inside the copy, `zig build -fsys=lmdb`, both Nix outputs and every job in `.github/workflows/verify.yml` still have no receipt over this tree. The 19 run failures all stop at `zig/root.zig:622` in `posixStatus`, where the unmapped `else` arm at `:635` reports `error.UnexpectedStatus` for an errno the switch does not know; **that is the frame, and the row above is the cause** — these logs carry no `ENOSYS` string of their own |
 
 What **has** run since §28, and is recorded with a receipt in the single gate
 table in `README.zig.md`: the full 53-cell matrix, `bash -n` over the profile and
@@ -1234,12 +1574,26 @@ since**, which is what the rows above say.
 
 ### `build.zig.zon` `.paths` — the open question, closed: ship the whole directory
 
-**Decision.** `.paths` is 16 entries and names `libraries/liblmdb` as a
+**Decision.** `.paths` names `libraries/liblmdb` as a
 directory, not forty-two individual paths. Everything upstream wrote for `liblmdb`
 travels — the three core units, the reference tool, both headers, the other four
 tools, the man pages, the test programs and sample databases, the build
 definitions and release notes, upstream's own `.gitignore`, and the two legal
 files — and so do this repository's five records and `UPSTREAM.sha256`.
+
+**Amended 2026-10-04, not reversed.** The decision still stands and its reasoning
+is untouched: `libraries/liblmdb` is named as a directory, and all 43 records have a
+file behind them in a materialised package. Two facts in the paragraph above moved
+with this migration wave and are corrected here rather than left to read as
+present-tense. The count is **23 entries**, not 16: `README.md`, `FORK-LICENSE.md`,
+`package.nix`, `flake.nix`, `devenv.nix`, `devenv.yaml` and `.envrc` joined it, so a
+fetched package carries its own licence record and its own Nix derivation.
+And "the reference tool" is now "the reference tool **plus the other four**":
+`build.zig` compiles and installs all five of upstream's `IPROGS`, where before it
+compiled only `mdb_dump`. Both moves are extensions of the same principle — ship
+what a consumer needs, not only what this build's own facade happens to call —
+and neither weakens the integrity record, which still covers exactly the 42
+upstream files and the one fixture.
 
 **What decided it.** Not "the documents are nice to have". The integrity record
 covers 43 files, the manifest shipped eight of the 42 upstream ones, and three
@@ -1300,9 +1654,19 @@ The job that asserts the WASI refusal is unchanged and is now backed by an
 observation made outside a runner: the build printed the reason and stopped with
 `error.UnsupportedTarget` before any C was compiled.
 
+**The `consumer` job needed a value it was not giving, on 2026-10-04.** It ran
+`zig build run` in `consumer/` with neither `-Dscratch` nor `LMDB_TEST_SCRATCH`,
+so the program took the refusal path and exited non-zero every time — a gate that
+cannot pass, failing for a reason unrelated to what it proves. It now exports
+`LMDB_TEST_SCRATCH` to `${{ runner.temp }}/lmdb-consumer-scratch` and creates
+that directory first. That is the whole change: no step gained
+`continue-on-error` or `|| true`, and no other job moved. See decision 15 and
+L26.
+
 **Still true and still outstanding.** The workflow has never executed. No `act`,
 no runner and no push have run it, and it remains `SOURCE-CONFIRMED` against the
-tree and `PENDING-VERIFICATION` as a gate.
+tree and `PENDING-VERIFICATION` as a gate. The consumer correction above is a
+reading of the file and the consumer sources, not a run.
 
 ### Out of this record's scope entirely
 
@@ -1333,9 +1697,17 @@ tree and `PENDING-VERIFICATION` as a gate.
   integrity record does and does not establish.
 * [`UPSTREAM.sha256`](UPSTREAM.sha256) — the integrity record itself.
 * [`NOTICE.md`](NOTICE.md) — the per-path legal record: the OLDAP-2.8 obligations,
-  the three further terms the tree retains with their lines, compiled core versus
-  carried-only files, upstream's two copyright lines, and every file this fork
-  adds.
+  the three further terms the tree retains with their lines, the complete per-file
+  inventory of all 42 upstream files, compiled core versus carried-only files,
+  what an installed output carries under which term, upstream's copyright-line
+  disagreements, and every file this fork adds.
+* [`FORK-LICENSE.md`](FORK-LICENSE.md) — the grant for every file this fork writes:
+  its authority, its SPDX identifier, what it does not reach, and where licence
+  material is installed in each delivery path. Read with L23, which is the lesson
+  behind it.
+* [`README.md`](README.md) — this fork's README: current native-source deviations,
+  current native-build deviations with their dated history, the build/run/test
+  matrix, and consumption.
 * [`README.zig.md`](README.zig.md) — how to build, import and call the package,
   with the full tables and the exact gate commands.
 * [`CHANGELOG.md`](CHANGELOG.md) — the numbered divergences this file explains.

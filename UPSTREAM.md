@@ -138,6 +138,53 @@ re-derived or reconfigured: there is no generated table, no patched upstream
 source, no upstream Makefile run, and no download at build time.
 `NOTICE.md` lists every file this fork adds or edits.
 
+**Upstream ships no README, and there is therefore no `README.upstream.md` here.**
+The working record for the pin — the driver's byte-verified upstream-README proof,
+`local://foundation-contract-upstream-readme-proof.json` — carries
+`"primary_readme": null` for this project, and that is not a gap in the import: at
+commit `6f0a32496a5aadee15a5e5103c479bd3355ae273` the tree has no file named
+`README`, `README.md` or `README.rst` at any depth. Of the 42 files this fork
+carries, the prose ones are `intro.doc` and `upgrading.doc`, both under
+`libraries/liblmdb/` and both OLDAP-2.8 (`intro.doc:2-6`, `upgrading.doc:2-6`),
+alongside five roff man pages. Those stay at those original paths, unmodified.
+
+The consequence for the documentation set is a rule, not an accident: **`README.md`
+in this repository is fork-authored in full, from its first line**, and must never
+be described as upstream's, as a copy of anything at the pin, or as "the upstream
+README, relocated". There is nothing at the pin for it to be a copy of.
+
+## Nix packaging, and what it is not
+
+`package.nix` is the SDK's whole Nix surface: one uncurried derivation over this
+directory, injected `{ lib, stdenv, zig, linkage ? "static" }`, returning one
+output. `flake.nix` and `devenv.nix` call that same file identically, which is why
+the variants live in the entry points rather than in it. No `../workspace` import,
+no sibling dependency, no host account or store path, no build-time download, and
+no Nix cross-compilation: the derivation refuses a `pkgsCross` stdenv because it
+neither exercises nor documents that path, while a remote builder for its own
+system is unaffected.
+
+What is worth recording here, because it is a property of upstream's material
+rather than of the packaging:
+
+* **The derivation installs nothing of its own.** It runs `build.zig`'s real
+  build once against `$out` with `-Dcpu=baseline -Dlinkage=<variant>` and both Zig
+  caches under the builder's `TMPDIR`. The C flags, the source list, the header,
+  the tools, the man pages, the `.pc` and the licence material all come from
+  `build.zig`, so there is one writer per path.
+* **The derivation never verifies `UPSTREAM.sha256`.** The integrity record is a
+  gate the driver runs and records; turning it into an unobserved build step
+  would report a result nobody took. The manifest reaches a dependent through
+  `.paths`, as a record, not as something an output claims to satisfy.
+* **There is no wholly-static claim anywhere.** The static archive still contains
+  `module.c`, and the consumer's link line still has to resolve `dlopen`; that is
+  what `Libs.private` records and why the README tells a static C consumer to pass
+  `pkg-config --static`.
+* **One platform gap is stated, not hidden.** `patchelf` rewrites ELF rpaths and
+  does not read Mach-O, so the build-cache rpath Zig adds is removed on ELF and
+  left on Darwin, where the `@loader_path/../lib` entry is added separately and the
+  tools resolve the installed library regardless.
+
 ## The C core: three translation units, and why three
 
 The whole library this package compiles is, by name:
@@ -197,10 +244,11 @@ licence judgement, and nothing here would be a reason to drop a file from
 
 ## Headers: one installed, both shipped
 
-`zig build` installs `liblmdb.a` and one header, `lmdb.h`
-(`build.zig:748-756`), because `lmdb.h` is the only header upstream installs —
-`IHDRS = lmdb.h` (`Makefile:49`). `midl.h` is upstream-internal and is not
-installed.
+`zig build` installs **one** header, `lmdb.h`, because that is the only header
+upstream installs — `IHDRS = lmdb.h` (`Makefile:49`). `midl.h` is
+upstream-internal and is not installed. That has not changed; what has changed is
+everything else the install prefix now carries, which is listed under
+"What an installed output contains" below.
 
 Both are nevertheless **shipped** in `build.zig.zon` `.paths`, because the
 compiled units need them by quoted name. Upstream records exactly this
@@ -236,6 +284,18 @@ package. `build.zig:251-253` panics rather than answering with an empty list
 for any operating system `lockBackend` accepted but this function has no
 decision for, so a new platform cannot lose its loader silently.
 
+**In an installed `.pc`, the same dependency is recorded and it differs by
+variant.** `build.zig` generates `lib/pkgconfig/lmdb.pc` — upstream writes one only
+through its own Makefile (`Makefile:147-158`), which this fork does not run. In the
+**static** variant the archive resolves nothing, so `Libs.private` carries the
+loader dependency (`-ldl -pthread` on ELF, `-lkernel32` on Windows, empty on
+Darwin) and a consumer who runs `pkg-config --static --libs lmdb` gets it. In the
+**shared** variant the dependency is already a `DT_NEEDED` entry inside the shared
+object, exactly as upstream's `Makefile:92` arranges, so `Libs.private` is empty
+and re-adding the flags would be wrong. Upstream's own template puts all of it on
+one `Libs:` line (`Makefile:158`), which is correct for neither variant and wrong
+for one of them.
+
 `mdb_dump` is compiled as a single translation unit and linked against **that
 same complete archive** (`build.zig:612-617`), which is how upstream links it
 (`Makefile:100-101`). Its `mdb_modload`/`mdb_modsetup`/`mdb_modunload`
@@ -250,6 +310,36 @@ separate `libpthread` would turn a complete library into a search for a file
 that exists only on the machine running the build. The CI gate's plain C
 consumer does repeat it (`.github/workflows/verify.yml:215-219`), because that link line is
 `zig cc`'s and not Zig's build graph.
+
+## What an installed output contains
+
+`zig build --prefix <p>` writes, in both variants:
+
+| Path | What | Upstream's own arrangement |
+|---|---|---|
+| `lib/liblmdb.a` or `lib/liblmdb.so.1.0.1` + symlinks | the three-unit library | `ILIBS`/`ILIBS2`, `Makefile:50-51`; upstream's shared name is `liblmdb.so.1.0` (`VEREXT = 1.0`, `Makefile:33-37`), this build's is `.so.1.0.1` because Zig names it for the pinned `version` |
+| `include/lmdb.h` | the public header | `IHDRS`, `Makefile:49`, installed at `Makefile:77` |
+| `lib/pkgconfig/lmdb.pc` | generated link metadata | upstream generates one at `Makefile:147-158`; three of its rows are answered differently here, recorded in `README.md` and `NOTICE.md` |
+| `bin/mdb_stat`, `bin/mdb_copy`, `bin/mdb_dump`, `bin/mdb_load`, `bin/mdb_drop` | upstream's five tools, each linked against the artifact this variant produced | `IPROGS`, `Makefile:52`, installed at `Makefile:70` |
+| `share/man/man1/mdb_*.1` | upstream's five man pages | `IDOCS`, `Makefile:53`, installed at `Makefile:78` |
+| `share/lmdb/LICENSE`, `share/lmdb/COPYRIGHT` | upstream's licence text and copyright notice, byte-identical to the two files in this directory | upstream's `install:` copies **neither** (`Makefile:65-78`); OLDAP-2.8's conditions 2 and 3 need them in a binary distribution, so this build installs them |
+| `bin/lmdb-smoke` | this fork's own smoke program, compiled and never run by `zig build` | no upstream counterpart |
+| `share/lmdb/NOTICE.md`, `FORK-LICENSE.md`, `UPSTREAM.md`, `UPSTREAM.sha256`, `README.md`, `README.zig.md`, `CHANGELOG.md`, `FORK-NOTES.md` | this fork's own records | no upstream counterpart. They travel because the fork's files are under OLDAP-2.8 too, so condition 2 applies to their notices as well. `UPSTREAM.sha256` installs as a record: its paths are relative to the package root, so it is not runnable from a prefix |
+
+**Two things are deliberately absent**, and both absences are upstream's own
+arrangement rather than an omission here. `midl.h` is not installed, because
+upstream installs only `lmdb.h`; it still ships in `.paths`, because the compiled
+units include it. And upstream's `intro.doc` and `upgrading.doc` are not in
+upstream's `install:` target either, so neither is in this build's install prefix;
+they travel in `.paths` and stay at those original paths. The man pages that are
+installed point a reader at `COPYRIGHT` and `LICENSE`, and both are installed
+beside them at `share/lmdb/`.
+
+**No data files.** LMDB has none, so that part of the install closure is empty by
+fact rather than by omission. The sample databases `sample-mdb.txt` and
+`sample-bdb.txt` are upstream's test fixtures for `mtest.c`, not runtime data, and
+they travel in the package source without being installed.
+
 
 ## What is upstream's, and what ships
 
@@ -415,9 +505,18 @@ from, and only `version` is asserted at configure time.
    total in its header if they moved. The record is byte-stable otherwise, and
    nothing this fork writes is in it.
 8. Update the archive receipt above, the pin in `build.zig`, `.version` in
-   `build.zig.zon`, this file, `NOTICE.md`, `README.zig.md`, and add one
-   numbered `CHANGELOG.md` entry.
-9. Re-read the licence-bearing headers of the new tree and update `NOTICE.md`'s
+   `build.zig.zon`, `version` in `package.nix`, this file, `README.md`,
+   `NOTICE.md`, `FORK-LICENSE.md`, `README.zig.md`, and add one numbered
+   `CHANGELOG.md` entry. `build.zig` already refuses to configure when the
+   manifest and the compiled pin disagree, and `package.nix` fails the build for
+   the same reason; what no tool checks is `package.nix` against the manifest,
+   so that pairing is on you.
+9. Re-read whether the new tag ships a README. If one appears, preserve those
+   exact bytes as `README.upstream.md` with its digest in this file, and say which
+   upstream path they came from. If it still does not, leave the absence recorded
+   in "What this fork is" and do **not** let the fork's own `README.md` be
+   described as an upstream file.
+10. Re-read the licence-bearing headers of the new tree and update `NOTICE.md`'s
    per-path table. Do not assume the terms are the ones this release carries:
    `CHANGES:9` records ITS#10540 "cleanup outdated license notices" **in this
    very release**, so the set of notices upstream carries is one upstream is
@@ -427,10 +526,18 @@ from, and only `version` is asserted at configure time.
 
 ## See also
 
+* `README.md` — this fork's README: current native-source deviations, current
+  native-build deviations with their dated history, the build/run/test matrix,
+  and consumption. **Not an upstream file**: upstream ships no README at this pin.
 * `NOTICE.md` — the per-path legal record: the OLDAP-2.8 terms and how they are
   met, **the three further terms the tree retains** with their paths and lines,
-  which files the build compiles versus only carries, where the licence text and
-  copyright notice actually live, and every file this fork adds.
+  the **complete per-file inventory of all 42 upstream files**, which files the build
+  compiles versus only carries, what an installed output installs under which term,
+  where the licence text and copyright notice actually live, and every file this
+  fork adds.
+* `FORK-LICENSE.md` — the grant for every file this fork writes: its authority,
+  its SPDX identifier, the full file list, what it does not reach, and where
+  licence material is installed in each delivery path.
 * `README.zig.md` — how to build, import and call the package, with the full
   operation, lifetime, error, flag and bounds tables, and the **single gate
   table** every observed result and its receipt are recorded in.

@@ -4,11 +4,18 @@
 .zig-cache/
 zig-out/
 
+# Zig 0.16 materialises a fetched dependency into a project-local `zig-pkg/`
+# beside the build root. This package declares no dependencies, so nothing
+# creates it here today; the entry is here so that a future dependency cannot
+# commit a fetched tree into the repository.
+zig-pkg/
+
 # The consumer package builds inside this repository and has its own output
 # tree. It is ignored here as well as in consumer/.gitignore so that a build run
 # from the repository root cannot commit it by accident.
 consumer/.zig-cache/
 consumer/zig-out/
+consumer/zig-pkg/
 
 # Upstream's own ignore rules are not restated here and not removed.
 # libraries/liblmdb/.gitignore is upstream's, unmodified: it covers what
@@ -21,8 +28,25 @@ consumer/zig-out/
 # build writes under zig-out/, which is ignored on its own account.
 #
 # This build never produces an upstream artifact in the source directory: it
-# compiles libraries/liblmdb/mdb.c and libraries/liblmdb/midl.c into
-# zig-out/lib, and `zig build interop` builds libraries/liblmdb/mdb_dump.c and
-# libraries/liblmdb/module.c into the Zig cache like everything else. Upstream's
-# `mdb_dump` pattern above is an exact name, so it would not have covered
-# `mdb_dump.c` in any case, and nothing is ever written beside the sources.
+# compiles the three core units (libraries/liblmdb/mdb.c, midl.c and
+# module.c) and upstream's five installed tools from their own sources into
+# zig-out, and `zig build interop` builds libraries/liblmdb/mdb_dump.c the same
+# way. Upstream's `mdb_dump` pattern above is an exact name, so it would not
+# have covered `mdb_dump.c` in any case, and nothing is ever written beside the
+# sources.
+
+# Development state, not source. `package.nix`, `flake.nix`, `devenv.nix`,
+# `devenv.yaml` and `.envrc` at the package root are the standalone Nix and
+# shell interface for this SDK, and the first four names below are what
+# entering that shell or letting `direnv` in leaves beside them; the last two
+# are what `nix build` leaves. None of them is named in build.zig.zon
+# `.paths`, so a `zig fetch` consumer never receives one of them, and
+# package.nix excludes the same names from its own source filter independently
+# of this file. `libraries/liblmdb/.gitignore` is upstream's own, is left
+# exactly as it is, and its bytes are a record in UPSTREAM.sha256.
+.devenv/
+.devenv.flake.nix
+.devenv.state/
+.direnv/
+result
+result-*

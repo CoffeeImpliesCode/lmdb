@@ -25,7 +25,9 @@ files of that directory travel with the package:
 
 The same sentence is restated in the header comment of 29 of the 42 files under
 `libraries/liblmdb/`, so a reader of the code finds the terms where the code is.
-The six files this package **compiles or installs** are all among those 29. The
+Every file this package **compiles or installs** is among those 29 — the three
+core units, both headers, the five tools and the two legal files — so nothing that
+reaches a consumer is one of the thirteen that restate nothing. The
 CI licence job is the digest itself now — `sha256sum -c UPSTREAM.sha256`, all 43
 records — rather than a computed closure over a written-out list: a digest of
 the file that carries a notice cannot be satisfied by a different file asserting
@@ -195,6 +197,169 @@ directory with holes in it is a re-sync bug waiting to happen.
 `COPYRIGHT:5-6`, which is where the grant is named. See "Integrity" in
 `UPSTREAM.md` for the digest that covers all of them.
 
+### The complete per-file inventory: all 42 files, every one of them
+
+The two lists above answer two questions well — which files restate the OpenLDAP
+sentence, and why the others do not — but neither of them is a per-file record, so
+neither can be audited without re-reading every header. This is that record. It
+covers **all 42 files under `libraries/liblmdb/`**, each named exactly once, with the
+term that governs it, where that term is written in that file's own bytes, what this
+package does with the file, and what an installed output carries.
+
+It is **35 rows for 42 files**, and the arithmetic is worth giving rather than
+rounding away. Thirty-three rows name one file each — the three core units
+(`mdb.c`, `midl.c`, `module.c`), both headers, the five tool sources, the two legal
+files, the five man pages, upstream's two prose files, the four files whose terms
+are not OLDAP-2.8 or are absent (`crypto.c`, `cryptoc.c`, `chacha8.c`,
+`chacha8.h`), `mplay.c`, `mtest_enc.c`, `mtest_remap.c` and the two sample
+databases. Two rows name a group that shares one term verbatim: `mtest.c` …
+`mtest6.c` (six files) and `mtest_enc2.c`, `mtest_enc3.c`, `mtest_enc4.c` (three).
+33 + 1 + 1 = 35 rows over 33 + 6 + 3 = **42 files**, and each of the 29 that
+restate the redistribution sentence and each of the 13 that do not appears here
+exactly once.
+
+Four columns matter and are kept apart on purpose. **Term** is what the file says,
+or — where it says nothing — that it says nothing. **Where** is the line range in
+that file, never another file's. **Role** is what the build does with it. **In
+the Nix output** says whether an installed output carries the file, and names who
+writes it there: the library, the header, the link metadata, the five tools, the
+five man pages and upstream's two legal files all come out of `build.zig`'s own
+install step. `package.nix` installs nothing of its own, so every "yes" in that
+column has exactly one writer.
+
+| File | Term | Where it is written | Role | In the Nix output |
+|---|---|---|---|---|
+| `LICENSE` | OLDAP-2.8, the licence text itself | `LICENSE:1-2` title, `:8-9` / `:11-14` / `:16` the three conditions; `:45` the OpenLDAP Foundation's own copyright paragraph | carried | **yes** — `$out/share/lmdb/LICENSE`, from `build.zig`; condition 3 requires this copy to travel |
+| `COPYRIGHT` | OLDAP-2.8, Howard Chu / Symas Corp. | `COPYRIGHT:1` copyright, `:5-6` the sentence that names the grant, `:12` the trademark notice | carried | **yes** — `$out/share/lmdb/COPYRIGHT`, from `build.zig`; condition 2's notice |
+| `lmdb.h` | OLDAP-2.8 **and** ISC-style, Martin Hedenfalk | OLDAP `lmdb.h:143-145`; Hedenfalk `lmdb.h:151-166`, closing `*/` at `:167`; copyright `:141` | **installed** public header, and the header `addTranslateC` translates | **yes** — `$out/include/lmdb.h` |
+| `mdb.c` | OLDAP-2.8 **and** ISC-style **and**, conditionally, public domain (FNV-1a) | OLDAP `mdb.c:10-13`; Hedenfalk `mdb.c:19-33`, closing `*/` at `:34`; FNV-1a `mdb.c:5846-5872`, **inside** `#ifdef MDB_USE_HASH` at `mdb.c:5845`; copyright `:8` | **compiled** — unit 1 of 3 | into the installed library or shared object |
+| `midl.c` | OLDAP-2.8, **two** copyright holders | `midl.c:6` The OpenLDAP Foundation, `:7` "Portions … Howard Chu, Symas Corp.", sentence `:10-12` | **compiled** — unit 2 of 3 | into the installed library or shared object |
+| `midl.h` | OLDAP-2.8, **two** copyright holders | `midl.h:14` and `:15`, sentence `:18-20` | **compiled** dependency of units 1 and 2; **not installed** (`IHDRS = lmdb.h`, `Makefile:49`) | no — internal header, and upstream installs only `lmdb.h` |
+| `module.c` | OLDAP-2.8, Howard Chu | `module.c:4-13` | **compiled** — unit 3 of 3; the dynamic crypto-module loader | into the installed library or shared object, and the reason `lmdb.pc` carries `Libs.private` in the static variant |
+| `mdb_dump.c` | OLDAP-2.8 | `mdb_dump.c:3-8` | compiled **twice over**: once for the `interop` gate, and once as upstream's installed dump tool (`IPROGS`, `Makefile:52`), each linked against this package's own artifact | **yes** — `$out/bin/mdb_dump`, from `build.zig` |
+| `mdb_stat.c` | OLDAP-2.8 | `mdb_stat.c:3-8` | upstream's tool (`Makefile:96-97`), compiled and installed | **yes** — `$out/bin/mdb_stat`, from `build.zig` |
+| `mdb_copy.c` | OLDAP-2.8 | `mdb_copy.c:3-8` | upstream's tool (`Makefile:98-99`), compiled and installed | **yes** — `$out/bin/mdb_copy`, from `build.zig` |
+| `mdb_load.c` | OLDAP-2.8 | `mdb_load.c:3-8` | upstream's tool (`Makefile:100-101`), compiled and installed | **yes** — `$out/bin/mdb_load`, from `build.zig` |
+| `mdb_drop.c` | OLDAP-2.8 — with the year range `2016-2021` exactly as written | `mdb_drop.c:3` | upstream's tool (`Makefile:102-103`), compiled and installed | **yes** — `$out/bin/mdb_drop`, from `build.zig` |
+| `mdb_dump.1` | copyright line and a licence **pointer** inside a roff comment; not the redistribution sentence and it does not render | `mdb_dump.1:2` "Copyright 2014-2026 …", `:3` "Copying restrictions apply.  See COPYRIGHT/LICENSE." | carried | **yes** — `$out/share/man/man1/mdb_dump.1`, from `build.zig` |
+| `mdb_stat.1` | as above, years `2012-2026` | `mdb_stat.1:2-3` | carried | **yes** — `$out/share/man/man1/mdb_stat.1` |
+| `mdb_copy.1` | as above, years `2012-2026` | `mdb_copy.1:2-3` | carried | **yes** — `$out/share/man/man1/mdb_copy.1` |
+| `mdb_load.1` | as above, years `2014-2026` | `mdb_load.1:2-3` | carried | **yes** — `$out/share/man/man1/mdb_load.1` |
+| `mdb_drop.1` | as above, years `2014-2026` | `mdb_drop.1:2-3` | carried | **yes** — `$out/share/man/man1/mdb_drop.1` |
+| `intro.doc` | OLDAP-2.8 | `intro.doc:2` copyright, `:4-6` the sentence | carried; upstream's prose introduction. Neither upstream's own `install` target nor this build's copies it (`Makefile:65-78`) | no — travels in `.paths` only |
+| `upgrading.doc` | OLDAP-2.8 | `upgrading.doc:2` copyright, `:4-6` the sentence | carried; upstream's upgrade notes, likewise not installed | no — travels in `.paths` only |
+| `crypto.c` | OLDAP-2.8; its `#include <sodium.h>` is a dependency mention, not a grant | `crypto.c:3-12`; dependency at `crypto.c:15` | carried; the payload of the loadable `crypto.lm` (`Makefile:123-124`) | no |
+| `cryptoc.c` | OLDAP-2.8; same `<sodium.h>` mention | `cryptoc.c:3-12`; dependency at `cryptoc.c:15` | carried; **named by no rule in upstream's Makefile at all** | no |
+| `chacha8.c` | **public domain, D. J. Bernstein** — not OLDAP-2.8 | `chacha8.c:1-5` | carried; upstream links it only into the **test** binary `mtest_enc` (`Makefile:113`) | no |
+| `chacha8.h` | **no notice of any kind.** No copyright, no grant, no attribution, in seven lines | the whole file | carried; compiled by nothing here or in `liblmdb.a` | no |
+| `mplay.c` | OLDAP-2.8 | `mplay.c:3-8` | carried; upstream's test program (`Makefile:121`) | no |
+| `mtest.c`, `mtest2.c`, `mtest3.c`, `mtest4.c`, `mtest5.c`, `mtest6.c` | OLDAP-2.8 in each | `mtest.c:3-8`; `mtest2.c:3-8`; `mtest3.c:3-8`; `mtest4.c:3-8`; `mtest5.c:3-8`; `mtest6.c:3-8` | carried; upstream's test programs (`Makefile:106-111`) | no |
+| `mtest_enc.c` | OLDAP-2.8 | `mtest_enc.c:3-8` | carried; upstream's encryption test (`Makefile:113`) | no |
+| `mtest_enc2.c`, `mtest_enc3.c`, `mtest_enc4.c` | OLDAP-2.8 in each | `mtest_enc2.c:3-8`; `mtest_enc3.c:3-8`; `mtest_enc4.c:3-8` | carried; they **load** `crypto.lm` at run time (`Makefile:114-118`) | no |
+| `mtest_remap.c` | OLDAP-2.8 | `mtest_remap.c:3-8` | carried; upstream's remap test (`Makefile:112`) | no |
+| `sample-mdb.txt` | OLDAP-2.8 | `sample-mdb.txt:6` copyright, `:8-10` the sentence | carried; upstream's sample environment | no |
+| `sample-bdb.txt` | OLDAP-2.8 | `sample-bdb.txt:6` copyright, `:8-10` the sentence | carried; upstream's sample environment, the comparison pair of the previous row | no |
+| `Makefile` | **no term in its own bytes.** It is upstream's build definition and is OLDAP material by the tree, not by a notice in it | — | carried; **no rule in `build.zig` reads it** | no |
+| `Doxyfile` | **no term in its own bytes** | — | carried; upstream's documentation configuration | no |
+| `CHANGES` | **no term in its own bytes** | — | carried; upstream's release notes | no |
+| `tooltag` | **no term in its own bytes** | — | carried; upstream's release tooling | no |
+| `.gitignore` | **no term in its own bytes** | — | carried **and hashed** in `UPSTREAM.sha256`; upstream's, not the fork root's | no |
+
+Four rows are the ones a single-label record gets wrong, and they are why this
+table exists:
+
+* `chacha8.c` is not OLDAP-2.8 at all, and is not upstream's work.
+* `chacha8.h` carries nothing. The DJB public-domain statement is recorded for
+  `chacha8.c` **only**; inferring it for the header would be this fork assigning
+  a grant its own author never wrote.
+* `mdb_drop.c:3` carries the year range `2016-2021`, which is not any other file's
+  range and is not a year this fork can correct in upstream's bytes. It is
+  recorded as read.
+* `mdb.c` carries **three** terms, not one, and the third is conditional on
+  `MDB_USE_HASH` — so its reach varies per target while the other two do not.
+
+### The tools and the man pages: what an installed output carries, and under which term
+
+Upstream's own `install` target names what a complete LMDB installation is, and
+it is a shorter list than "everything in the directory" and a longer one than
+"the library":
+
+```
+install: $(ILIBS) $(IPROGS) $(IHDRS)          # Makefile:65
+ILIBS  = liblmdb.a                             # Makefile:50
+IHDRS  = lmdb.h                                # Makefile:49
+IPROGS = mdb_stat mdb_copy mdb_dump mdb_load mdb_drop   # Makefile:52
+IDOCS  = mdb_stat.1 mdb_copy.1 mdb_dump.1 mdb_load.1 mdb_drop.1   # Makefile:53
+```
+
+and it copies them to `$(bindir)`, `$(libdir)`, `$(includedir)` and
+`$(mandir)/man1` respectively (`Makefile:66-78`), with the shared library
+installed under its `SOFULL` name and two symlinks beside it (`Makefile:72-76`).
+
+`build.zig`'s install step reproduces that set for both variants and `package.nix`
+runs it: the library, `lmdb.h`, the generated `lmdb.pc`, upstream's five tools,
+their five man pages and upstream's two legal files all come from there, and the
+derivation adds nothing of its own. **Every one of those files is OLDAP-2.8**,
+with the single exception of the tools' own man pages, which carry a copyright line and a
+pointer to `COPYRIGHT`/`LICENSE` in a roff comment rather than the redistribution
+sentence. That pointer resolves inside the output, because
+`$out/share/lmdb/LICENSE` and `$out/share/lmdb/COPYRIGHT` are the same two files
+the pointer names. No public-domain DJB file, no `<sodium.h>`-dependent file and
+no upstream test program is installed into an output: none of them is part of a
+usable LMDB installation, and the ones that travel in the package source keep
+their own terms where they are, in the table above.
+
+One honest limit belongs here. Upstream installs `$(ILIBS)` and `$(ILIBS2)` from
+`install:` — both the static archive and the shared library — from a single
+invocation (`Makefile:65`, `:71-76`). A Nix variant installs **one** of them,
+because `static` and `shared` are separate derivations rather than one output
+carrying both. Neither variant is upstream's `install` target reproduced whole,
+and no output contains `liblmdb.so.1.0`: the shared variant's file is
+`liblmdb.so.1.0.1` with symlinks `liblmdb.so.1` and `liblmdb.so`, which is Zig's
+naming for `version = 1.0.1` and not upstream's `SOFULL` (`VEREXT = 1.0`,
+`Makefile:33-37`). `README.md` records that as a current native-build deviation.
+
+### `module.c` and the loader dependency in link metadata
+
+`module.c` is the one compiled file whose licence record and whose link
+metadata are the same subject, so both are recorded here rather than only in
+`UPSTREAM.md`. It is unit 3 of 3 in `liblmdb.a` (`Makefile:87-88`, restated in
+`build.zig`'s core-unit list), it is OLDAP-2.8 (`module.c:4-13`), and it calls
+the platform's dynamic loader: `dlopen`/`dlsym`/`dlerror`/`dlclose` on POSIX
+(`module.c:51-66`, `:77-78`, reached through `<dlfcn.h>` at `:17`) and
+`LoadLibrary`/`GetProcAddress`/`FreeLibrary` on Windows (`module.c:33-49`,
+`:74-76`, through `<windows.h>` at `:15`). Upstream records the requirement once,
+as `LDL = -ldl` (`Makefile:31`), and puts it on the shared link line
+(`Makefile:92`) and in the generated pkg-config file (`Makefile:158`).
+
+What that means for the two Nix variants, and it is different in each:
+
+| Variant | The `-ldl` dependency is… | Consequence for a consumer |
+|---|---|---|
+| `static` | **not** resolved by the archive. It must appear in the consumer's own link line | `lib/pkgconfig/lmdb.pc` records it as `Libs.private`, so `pkg-config --static --libs lmdb` yields it and a plain `pkg-config --libs lmdb` does not |
+| `shared` | resolved **inside** the shared object, exactly as upstream's `Makefile:92` does | a consumer links `-llmdb` only; `Libs.private` is empty, because there is nothing left for the consumer to resolve |
+
+On macOS and the other Darwin targets there is no such dependency to record:
+Darwin takes the POSIX arm of `module.c` and its `dl*` entry points come from
+libSystem, which the C library already is. The generated `lmdb.pc` therefore
+carries an empty `Libs.private` there rather than a GNU-ld flag name that does not
+apply, which is the same reason upstream leaves `-Wl,-current_version` commented
+out (`Makefile:58-59`) and why `-pthread` is deliberately not repeated on Zig's
+link line.
+
+**The `.pc` file is generated by `build.zig`, not written by `package.nix` and not
+installed from a template.** Upstream writes one at `Makefile:147-158` from
+eight `echo` lines, this fork has no `lmdb.pc.in`, and the derivation therefore
+does not create or overwrite it. Three rows of upstream's template are answered
+differently here and each difference is deliberate: `Version:` states the pinned
+`1.0.1` rather than upstream's hardcoded `LMDB_VERSION = 1.0.0` (`Makefile:36`);
+the loader and thread flags move from `Libs:` into `Libs.private:` and only in the
+static variant, because in the shared variant they are already inside the shared
+object and re-adding them is wrong; and the file is made relocatable with
+`prefix=${pcfiledir}/../..`, which upstream's version is not — upstream writes a
+literal `prefix=$(prefix)` (`Makefile:148`) that a relocated copy would carry into
+the wrong place. `README.md` records all three as current native-build deviations.
+
 ### An upstream disagreement between two copyright lines, neither corrected here
 
 `libraries/liblmdb/lmdb.h:141` says:
@@ -236,8 +401,9 @@ What this package does about each:
   `OK`**, every upstream file and the one independent fixture
   (`local://foundation-expansion-lmdb-immutable-source-fixture-integrity-219.log`)
   — so upstream's notices are intact by observation. The notices are also in the
-  sources themselves, in all six of the files the build compiles or installs.
-  Those six carry more than the OLDAP sentence: `lmdb.h` and `mdb.c` also carry
+  sources themselves, in every file the build compiles or installs: the three core
+  units, both headers, the five tools and the two legal files. Three of those
+  carry more than the OLDAP sentence: `lmdb.h` and `mdb.c` also carry
   the Hedenfalk grant at `lmdb.h:151-166` and `mdb.c:19-33`, and `mdb.c` carries
   the FNV-1a public-domain notice at `mdb.c:5846-5872`. Condition 1 is therefore
   retaining three distinct notices in the compiled core, not one.
@@ -247,20 +413,32 @@ What this package does about each:
   and the Hedenfalk copyright and
   permission notice in its own header (`lmdb.h:141-146` and `lmdb.h:151-166`).
   Condition 2 asks for "applicable copyright statements and notices", and those
-  two ranges are the applicable ones in the one header the prefix receives. One
-  honest limit is worth naming.
-  `zig build install` writes `liblmdb.a` and `lmdb.h` into `zig-out/` and copies
-  neither legal file there (`build.zig:748-756`), so **a downstream that ships
-  only `zig-out/` and nothing else has shipped a binary form without the
-  accompanying conditions text.** Condition 2 asks for it "in the documentation
-  and/or other materials provided with the distribution", and a downstream
-  shipping the package source has them; one shipping the install tree alone has
-  to add the two files itself. The fix — an `installHeader`-shaped step that
-  copies `LICENSE` and `COPYRIGHT` into the prefix — belongs to whoever owns
-  `build.zig`, not to this record. It is named here rather than left for
-  someone to find.
+  two ranges are the applicable ones in the one header the prefix receives. Since
+  the fork's own files are now under a grant too (see "The fork's own files are
+  under a grant" above), this condition has **two** sets of applicable
+  statements — upstream's and this fork's — and both have to reach a binary
+  recipient. Three delivery paths, and they are not equally complete:
+
+  | Delivery path | Library + header | Upstream `LICENSE`/`COPYRIGHT` | Fork's `NOTICE.md`/`FORK-LICENSE.md` |
+  |---|---|---|---|
+  | package source, via `.paths` (a `zig fetch` of this package) | built by the consumer | **yes** — `.paths` names the whole `libraries/liblmdb` directory | **yes** — `.paths` names the document set |
+  | Nix output, via `package.nix` | **yes** — `build.zig`'s install step | **yes** — `share/lmdb/LICENSE` and `COPYRIGHT`, from the same bytes | **yes** — `share/lmdb/NOTICE.md` and `FORK-LICENSE.md`, with the rest of this fork's records |
+  | `zig build install` on its own, the tree alone | **yes** — `build.zig`'s install step | **yes** — `share/lmdb/LICENSE` and `COPYRIGHT` | **yes** — the same records, written by the same step |
+
+  **Both halves are now met on all three paths, and the gap this section used to
+  name is closed.** An earlier state said `zig build install` wrote the library and
+  the header and copied neither legal file there. `build.zig`'s install step now
+  writes upstream's `LICENSE` and `COPYRIGHT` from the very same bytes under
+  `libraries/liblmdb/`, and this fork's own eight records beside them, because
+  applying OLDAP-2.8 to the packaging made its notices "applicable copyright
+  statements and notices" in their own right. Nothing else writes any of those
+  paths: `package.nix` installs nothing of its own. **Every row in this table is
+  `PENDING-VERIFICATION` for this wave's tree**: each is a contract read out of
+  `build.zig` and `package.nix`, and no gate has observed any install prefix since
+  it changed.
 * **Condition 3.** `libraries/liblmdb/LICENSE` is in `.paths`, verbatim, 2214
-  bytes, unedited, and is hashed in `UPSTREAM.sha256`.
+  bytes, unedited, and is hashed in `UPSTREAM.sha256`. It is also installed into
+  every Nix output, so the verbatim copy travels with the binary there too.
 
 OLDAP-2.8 has **no** patent grant and therefore no patent-grant termination
 clause, and it requires **no** `NOTICE` file, no statement of changed files and
@@ -273,11 +451,21 @@ omission.
 ### No sublicensing is invented anywhere
 
 Upstream's own grant on its own code is OLDAP-2.8, and this package does not
-relicense it, does not offer it under a second grant, does not assert that the
-Zig facade is a separate work of the OpenLDAP Foundation, and does not claim any
-licence over upstream's name or marks. `COPYRIGHT:12` and `LICENSE:43` both note
-that "OpenLDAP is a registered trademark of the OpenLDAP Foundation", and this
-package uses the name only to identify whose work it is.
+relicense it, does not offer it under a second, competing grant, does not assert
+that the Zig facade is a separate work of the OpenLDAP Foundation, and does not
+claim any licence over upstream's name or marks. `COPYRIGHT:12` and `LICENSE:43`
+both note that "OpenLDAP is a registered trademark of the OpenLDAP Foundation",
+and this package uses the name only to identify whose work it is.
+
+**One clause of this section needed amending when the fork's own files got a
+grant, and it is amended here rather than left to be read two ways.** The
+fork-authored files are now offered under OLDAP-2.8 as well. That is a grant over
+*this fork's* files, not a second grant over *upstream's*, and it changes the
+term on nothing upstream wrote. "Does not offer it under a second grant" means
+**no upstream file is offered under two terms at once**; the fork's own
+additions are a different set of files with their own history, and they were
+never covered by upstream's grant in the first place. `FORK-LICENSE.md` states the
+boundary in the form this section now uses.
 
 The earlier wording of this section said the grant on the C was "OLDAP-2.8 and
 nothing else". **That was wrong**, and it is recorded here rather than quietly
@@ -297,15 +485,52 @@ are upstream's retentions, reproduced here because `libraries/liblmdb/` is
 byte-identical to the pin; this record names them so they are not mistaken for
 absent, and it does not extend, re-scope or combine them.
 
-The fork's own files — `build.zig`, `build.zig.zon`, `translate.h`,
-`zig/root.zig`, `tests.zig`, `smoke.zig`, `cross-test.profile.sh`,
-`testdata/interop.zig`, `consumer/`, `.github/workflows/verify.yml`, this
-document set and the fixture — carry no licence statement of their own in this
-repository, and this record does not invent one for them. OLDAP-2.8 imposes no
-condition that they have one. This
-repository is private and unpublished; the moment it is published the question
-of a licence for the fork's own files becomes the owner's decision, and it is
-recorded here as **PENDING-VERIFICATION** rather than answered.
+### The fork's own files are under a grant, and it is the same term
+
+Earlier revisions of this section said the fork's own files "carry no licence
+statement of their own" and recorded the question as **PENDING-VERIFICATION**,
+pending an owner decision. **That decision has been made**, and the earlier
+wording is superseded by this one and by [`FORK-LICENSE.md`](FORK-LICENSE.md).
+
+The repository owner authorized, for this migration wave, a **per-project licence
+for fork-authored additions, matching the project's primary upstream terms where
+appropriate** (`AGENTS.md` §8; the wave contract at
+`local://foundation-contract-implementation.md` §"Licence authorization"). LMDB's
+primary upstream term is OLDAP-2.8, and the term chosen for this fork's own files
+is therefore **The OpenLDAP Public License, Version 2.8, 17 August 2003**,
+SPDX identifier `OLDAP-2.8`, matching the primary upstream term rather than
+inventing a second one. `FORK-LICENSE.md` carries the authorization, the full
+file list it covers, what it explicitly does not cover, and the two clauses of
+that text which constrain how the names in it may be used.
+
+Three limits on that grant, which are stated here so they are not read the other
+way:
+
+* **It does not extend, narrow or re-scope any upstream term.** The ISC-style
+  grant, both public-domain notices and `chacha8.h`'s silence keep exactly the
+  scope the files themselves give them. Applying OLDAP-2.8 to the packaging
+  changes nothing about what Howard Chu, the OpenLDAP Foundation, Martin
+  Hedenfalk, Landon Curt Noll or D. J. Bernstein granted.
+* **It attributes nothing to an upstream author.** The OpenLDAP Foundation is
+  not an author of a single file listed in `FORK-LICENSE.md`, and this grant does
+  not say it is — including where the licence text's own warranty paragraph
+  names it. That paragraph is reproduced as part of a fixed document; it is a
+  disclaimer travelling with a permission, not an authorship statement, and
+  `FORK-LICENSE.md` says so in those words. No personal copyright identity is
+  invented for the fork's files anywhere in this repository.
+* **It is a grant, not a title.** OLDAP-2.8 says "Title to copyright in this
+  Software shall at all times remain with copyright holders", and nothing here
+  purports to transfer any title in upstream's work.
+
+**One consequence is new and is an obligation this fork now has.** Before this
+grant the fork's files carried no copyright statement, so OLDAP-2.8's
+condition 2 — "Redistributions in binary form must reproduce applicable
+copyright statements and notices, this list of conditions, and the following
+disclaimer in the documentation and/or other materials provided with the
+distribution" — had nothing of the fork's own to reproduce. It has something
+now. All three delivery paths meet it: `build.zig`'s install step writes this
+fork's records beside upstream's legal files at `share/lmdb/`, and `.paths`
+carries them in a fetched package.
 
 ## What this fork changed
 
@@ -316,7 +541,7 @@ every one of them. Every other file in the package is a file this fork wrote:
 | Path | What it is |
 |---|---|
 | `build.zig` | the build graph: the three-unit core, the `translate.h` translation, the `lmdb` module, the six-target `check` matrix, `interop`, `consumer` |
-| `build.zig.zon` | the package manifest, `.version = "1.0.1"`, and the 16-entry `.paths` that ships the whole `libraries/liblmdb` directory |
+| `build.zig.zon` | the package manifest, `.version = "1.0.1"`, and the 23-entry `.paths` that ships the whole `libraries/liblmdb` directory alongside this fork's build, facade, consumer, profile, licence and packaging files |
 | `translate.h` | the single translation unit handed to `addTranslateC`; its whole content is `#include <lmdb.h>` |
 | `zig/root.zig` | the Zig facade over the translated `lmdb.h` |
 | `tests.zig` | the behavioural tests — 25 of them |
@@ -327,6 +552,30 @@ every one of them. Every other file in the package is a file this fork wrote:
 | `consumer/build.zig`, `consumer/build.zig.zon`, `consumer/src/main.zig`, `consumer/.gitignore` | a separate package that depends on this one by relative path, to prove `dep.module("lmdb")` resolves from outside |
 | `.github/workflows/verify.yml` | this repository's own CI, six jobs. LMDB ships no GitHub Actions workflow, so there was no upstream file to retarget |
 | `UPSTREAM.md`, `UPSTREAM.sha256`, `NOTICE.md`, `README.zig.md`, `CHANGELOG.md`, `FORK-NOTES.md` | the provenance, licence, usage and divergence set |
+| `README.md` | this fork's README: current native-source deviations, current native-build deviations and their dated history, the current build/run/test matrix, and consumption |
+| `README.zig.md` | the Zig interface documentation, kept separate from `README.md` |
+| `FORK-LICENSE.md` | the grant for every file this fork writes, its authority, its SPDX identifier, and what it does not cover |
+| `package.nix` | the standalone source-only derivation, injected `{ lib, stdenv, zig, linkage ? "static" }`, called identically by `flake.nix` and `devenv.nix` |
+| `flake.nix` | the pinned-nixpkgs entry points: `packages.<system>.static`, `.shared`, `.default` |
+| `devenv.nix` | the canonical development shell: tools, namespaced `lmdb:*` tasks, and lazy `outputs.static` / `outputs.shared` |
+| `devenv.yaml` | the pinned devenv `nixpkgs` input |
+| `.envrc` | direnv integration for that devenv shell |
+| `UPSTREAM.md`, `UPSTREAM.sha256`, `NOTICE.md`, `CHANGELOG.md`, `FORK-NOTES.md` | the provenance, integrity, licence, divergence and decision records |
+
+**There is no `README.upstream.md` in this repository, and there is not
+supposed to be one.** Upstream's tree at commit
+`6f0a32496a5aadee15a5e5103c479bd3355ae273` carries **no README at any depth**:
+the working record for the pin names no primary README, and the 42 files this
+fork carries from upstream — all of `libraries/liblmdb/` — contain no file named
+`README`, `README.md` or `README.rst`. The driver's byte-verified upstream-README
+proof records `"primary_readme": null` for this project for exactly that reason.
+`README.md` in this tree is therefore **fork-authored in full**, from the first
+line, and it is never described as upstream's or as a copy of anything at the pin.
+What upstream does ship in prose is `libraries/liblmdb/intro.doc` and
+`libraries/liblmdb/upgrading.doc`, both OLDAP-2.8 (`intro.doc:2-6`,
+`upgrading.doc:2-6`), together with the five roff man pages; those three kinds of
+file stay at those original paths, unmodified, inside `.paths`, and none of them
+is relocated, renamed or copied into the fork's documentation.
 
 Two of those deserve a sentence of their own:
 
@@ -425,9 +674,15 @@ three core units one by one (`build.zig:76-80`) and never name these four.
   header closure, the loader dependency, and what the integrity record does and
   does not establish.
 * [`UPSTREAM.sha256`](UPSTREAM.sha256) — the integrity record itself.
-* [`README.zig.md`](README.zig.md) — how to build, import and call the package,
-  with the operation, lifetime, error, flag and bounds tables and the exact gate
-  commands.
+* [`FORK-LICENSE.md`](FORK-LICENSE.md) — the grant for every file this fork
+  writes: its authority, its SPDX identifier, the full list it covers, what it
+  does not cover, and where licence material is installed in each delivery path.
+* [`README.md`](README.md) — this fork's README: native-source deviations,
+  native-build deviations and their dated history, the current build/run/test
+  matrix, and consumption.
+* [`README.zig.md`](README.zig.md) — the Zig interface documentation, kept
+  separate from `README.md`: how to build, import and call the package, with the
+  operation, lifetime, error, flag and bounds tables and the exact gate commands.
 * [`CHANGELOG.md`](CHANGELOG.md) — numbered fork-only divergences, each with its
   receipt.
 * [`FORK-NOTES.md`](FORK-NOTES.md) — the decisions, their reasons, and the

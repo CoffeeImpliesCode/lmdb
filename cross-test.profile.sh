@@ -19,7 +19,14 @@
 #     target with no detected runner is reported as build-only and never as a
 #     pass.
 #   * No `CROSS_BUILD_ARGS`. The gate is this package's own `test` step in its
-#     own default Debug mode: no `-Dtarget`, no `-Doptimize`, no added flags.
+#     own default Debug mode: no `-Dtarget`, no `-Doptimize`, no added flags -
+#     and no `-Dlinkage` either, so all 53 cells compile and link the archive
+#     this package builds by default. The shared form is a separate, explicit
+#     gate (`zig build test -Dlinkage=dynamic`, and
+#     `zig build check -Dlinkage=dynamic` for the target matrix): a matrix that
+#     walked 53 platforms and switched the delivery form halfway through would
+#     be two matrices under one name. The option is stated in build.zig's own
+#     help text instead, which is where a caller reads what it changes.
 #   * No host path of any kind. Scratch and cache placement is `cross-test`'s
 #     own host policy (`lib/host-scratch.sh`), which it sources before it reads
 #     any name in this file, and this package resolves nothing from a path it

@@ -20,10 +20,65 @@
 //! — and that directory is removed on the way out. A host that names no
 //! temporary root gets `.zig-cache/tmp/<random>`, the convention
 //! `std.testing.tmpDir` uses.
+//!
+//! ## The one configuration difference
+//!
+//! In a runtime-loading build (`-Druntime=true`) nothing works until a provider
+//! is named: `--provider <path>` on this program's own command line, or
+//! `LMDB_TEST_PROVIDER` in the environment. Both are explicit; nothing here
+//! looks in a default location and nothing falls back to a bundled copy, so a
+//! runtime-loading build that was not told which file to open says so instead
+//! of loading something else. The first line of the output says which
+//! configuration the run was in. A linked build reads neither.
 
 const std = @import("std");
 const lmdb = @import("lmdb");
 const builtin = @import("builtin");
+
+/// A shared object exporting the `mdb_*` entry points of
+/// `libraries/liblmdb/lmdb.h`, named by the environment in a runtime-loading
+/// build.
+const provider_variable = "LMDB_TEST_PROVIDER";
+
+/// A runtime-loading build has no provider until one is named. The allocator's
+/// own failure is in the set because reading the command line and the
+/// environment allocates, and an out-of-memory is not the same as "nobody said
+/// which file to open".
+const ConfigurationError = error{ NoProviderConfigured, Unexpected } || std.mem.Allocator.Error;
+
+/// The provider this run should load, from `--provider <path>` or from
+/// `LMDB_TEST_PROVIDER`.
+fn providerRequest(
+    init: std.process.Init.Minimal,
+    arena: std.mem.Allocator,
+) ConfigurationError![]const u8 {
+    const args = try init.args.toSlice(arena);
+    // `args[0]` is this program's own path.
+    var index: usize = if (args.len == 0) 0 else 1;
+    while (index < args.len) : (index += 1) {
+        if (std.mem.eql(u8, args[index], "--provider")) {
+            if (index + 1 >= args.len) return noProvider();
+            return args[index + 1];
+        }
+    }
+    return init.environ.getAlloc(arena, provider_variable) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.EnvironmentVariableMissing, error.InvalidWtf8 => return noProvider(),
+    };
+}
+
+/// Say which variable is missing. An error name on its own would send the next
+/// person into the loader instead of to the command line.
+fn noProvider() ConfigurationError {
+    std.debug.print(
+        "smoke: this is a runtime-loading build. Pass --provider <path>, or " ++
+            "export " ++ provider_variable ++ " with a shared object exporting " ++
+            "the mdb_* entry points of libraries/liblmdb/lmdb.h. Nothing is " ++
+            "loaded by default and no other file is tried.\n",
+        .{},
+    );
+    return error.NoProviderConfigured;
+}
 
 /// The upstream release the C in this tree is pinned to; the version *number*
 /// checked below comes from the compiled library itself.
@@ -186,13 +241,30 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
     const out = &stdout.interface;
 
+    // In a runtime-loading build nothing below can run until a provider is
+    // loaded, and the load is the one explicit step the contract asks for. In a
+    // linked build this is a no-op at comptime and the module is already
+    // usable.
+    if (comptime lmdb.runtime_loaded) {
+        try lmdb.load(.{ .path = try providerRequest(init, gpa) });
+    }
+
+    // Read back out of the library rather than from a constant compiled here,
+    // so these two lines name the liblmdb this build actually reached.
     const version = lmdb.version();
     try out.print("lmdb smoke\n", .{});
     try out.print("upstream tag {s}\n", .{upstream_tag});
-    try out.print("linked library version {d}.{d}.{d}\n", .{
+    const route = if (lmdb.runtime_loaded) "loaded" else "linked";
+    try out.print("{s} library version {s}\n", .{ route, lmdb.versionString() });
+    // The three integers `mdb_version` filled, and the text `mdb_strerror`
+    // builds for one of its own negative codes — two more entry points of the
+    // same raw surface, read back out of the library rather than out of a
+    // constant compiled here.
+    try out.print("library reports {d}.{d}.{d}; MDB_NOTFOUND is \"{s}\"\n", .{
         version.major,
         version.minor,
         version.patch,
+        lmdb.strerror(lmdb.c.MDB_NOTFOUND),
     });
 
     var scratch = try Scratch.init(io, gpa, init.environ);
@@ -202,9 +274,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try out.print("\nwrite, commit, sync, reopen\n", .{});
     try writeAndCommit(scratch.path);
     try readBackAndWalk(scratch.path, out);
+    try borrowFromTheMap(scratch.path, out);
     try duplicatesUnderOneKey(scratch.path, out);
     try boundariesAndErrors(scratch.path, out);
-    try borrowFromTheMap(scratch.path, out);
+    try twoPhaseCommit(scratch.path, out);
 
     try out.print("\nall observations agreed\n", .{});
     try out.flush();
@@ -232,6 +305,55 @@ fn writeAndCommit(path: [:0]const u8) !void {
 
     try txn.commit();
     try env.sync(true);
+}
+
+/// The two-phase commit path, and the boundary it draws.
+///
+/// One transaction is prepared and then committed, one is prepared and then
+/// abandoned, and both are checked through a reader that started afterwards.
+/// Between the prepare and the commit or abort nothing else is defined, and the
+/// facade says so rather than letting the C be reached: that refusal is the
+/// first observation here, because it is the one this build's own wrapper
+/// makes.
+fn twoPhaseCommit(path: [:0]const u8, out: *std.Io.Writer) !void {
+    var env = try lmdb.Environment.init(.{ .path = path });
+    defer env.close();
+
+    var kept = try env.beginWrite();
+    defer kept.abort();
+    const kept_db = try kept.openDatabase(null, .{});
+    try kept.put(kept_db, "prepared-and-committed", "kept");
+    try kept.prepare();
+    try requireError(
+        error.TxnPending,
+        kept.get(kept_db, "prepared-and-committed"),
+        "a prepared transaction answers only commit and abort",
+    );
+    try kept.commit();
+
+    var lost = try env.beginWrite();
+    defer lost.abort();
+    const lost_db = try lost.openDatabase(null, .{});
+    try lost.put(lost_db, "prepared-and-abandoned", "lost");
+    // These pages are written before this point, which is what makes abandoning
+    // the transaction the interesting case rather than a write that never
+    // reached the file.
+    try lost.prepare();
+    lost.abort();
+
+    var reader = try env.beginReadOnly();
+    defer reader.abort();
+    const db = try reader.openDatabase(null, .{});
+    try require(
+        std.mem.eql(u8, "kept", try reader.get(db, "prepared-and-committed")),
+        "the prepared transaction's pages reached the database when it committed",
+    );
+    try require(
+        if (reader.get(db, "prepared-and-abandoned")) |_| false else |err| err == error.NotFound,
+        "the abandoned prepared transaction left no record",
+    );
+
+    try out.print("prepared: committed record kept, abandoned record absent\n", .{});
 }
 
 /// Reopen read-only — a different environment handle, a different mapping of
