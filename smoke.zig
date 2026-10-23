@@ -1,59 +1,23 @@
-//! A runnable demonstration of the LMDB facade, and a check of it.
-//!
-//! Every value below is fixed, so the output is the same on every host and a
-//! change in it is a change in behaviour rather than in timing or in a random
-//! seed. The one exception is the width of the main database's catalogue
-//! record, which is the width of the core's own `MDB_db` and so follows the
-//! word size of the target; it is printed because it is also checked. The
-//! program fails — non-zero, with the observation that disagreed named on
-//! stderr — the moment an expectation is not met, so `zig build smoke` is a
-//! check and not a demo that always succeeds.
-//!
-//! What it exercises that `tests.zig` does not is the whole lifecycle in one
-//! process, in order: create, configure, open, write, commit, sync, close,
-//! reopen read-only, walk, and release. The library version is printed at the
-//! top so the output names the upstream it exercised; it is read back out of
-//! the compiled core rather than taken from a constant.
-//!
-//! The environment lives in a directory of its own under the temporary root
-//! the process was started with — `TMPDIR`, and on Windows `TEMP` then `TMP`
-//! — and that directory is removed on the way out. A host that names no
-//! temporary root gets `.zig-cache/tmp/<random>`, the convention
-//! `std.testing.tmpDir` uses.
-//!
-//! ## The one configuration difference
-//!
-//! In a runtime-loading build (`-Druntime=true`) nothing works until a provider
-//! is named: `--provider <path>` on this program's own command line, or
-//! `LMDB_TEST_PROVIDER` in the environment. Both are explicit; nothing here
-//! looks in a default location and nothing falls back to a bundled copy, so a
-//! runtime-loading build that was not told which file to open says so instead
-//! of loading something else. The first line of the output says which
-//! configuration the run was in. A linked build reads neither.
+//! Deterministic smoke check for the LMDB facade, covering create through read-only reopen.
+//! It checks each observation and removes its temporary environment.
+//! Runtime-loaded builds need `--provider <path>` or `LMDB_TEST_PROVIDER`; linked builds do not.
 
 const std = @import("std");
 const lmdb = @import("lmdb");
 const builtin = @import("builtin");
 
-/// A shared object exporting the `mdb_*` entry points of
-/// `libraries/liblmdb/lmdb.h`, named by the environment in a runtime-loading
-/// build.
+/// Runtime provider environment variable for a shared object exporting `mdb_*`.
 const provider_variable = "LMDB_TEST_PROVIDER";
 
-/// A runtime-loading build has no provider until one is named. The allocator's
-/// own failure is in the set because reading the command line and the
-/// environment allocates, and an out-of-memory is not the same as "nobody said
-/// which file to open".
+/// Provider-selection errors, including allocation failures.
 const ConfigurationError = error{ NoProviderConfigured, Unexpected } || std.mem.Allocator.Error;
 
-/// The provider this run should load, from `--provider <path>` or from
-/// `LMDB_TEST_PROVIDER`.
+/// Select the provider from `--provider <path>` or `LMDB_TEST_PROVIDER`.
 fn providerRequest(
     init: std.process.Init.Minimal,
     arena: std.mem.Allocator,
 ) ConfigurationError![]const u8 {
     const args = try init.args.toSlice(arena);
-    // `args[0]` is this program's own path.
     var index: usize = if (args.len == 0) 0 else 1;
     while (index < args.len) : (index += 1) {
         if (std.mem.eql(u8, args[index], "--provider")) {
@@ -67,8 +31,7 @@ fn providerRequest(
     };
 }
 
-/// Say which variable is missing. An error name on its own would send the next
-/// person into the loader instead of to the command line.
+/// Return the missing-provider error with its configuration hint.
 fn noProvider() ConfigurationError {
     std.debug.print(
         "smoke: this is a runtime-loading build. Pass --provider <path>, or " ++
@@ -80,11 +43,10 @@ fn noProvider() ConfigurationError {
     return error.NoProviderConfigured;
 }
 
-/// The upstream release the C in this tree is pinned to; the version *number*
-/// checked below comes from the compiled library itself.
+/// Pinned upstream release; the checked version comes from the compiled library.
 const upstream_tag = "LMDB_1.0.1";
 
-/// A failed observation, named.
+/// Fail with a named observation when its expectation is false.
 fn require(ok: bool, what: []const u8) error{Disagreed}!void {
     if (!ok) {
         std.debug.print("smoke: disagreed: {s}\n", .{what});
@@ -92,8 +54,7 @@ fn require(ok: bool, what: []const u8) error{Disagreed}!void {
     }
 }
 
-/// The same, for an observation whose expectation is an error rather than a
-/// value.
+/// Fail with a named observation when the result does not match `expected`.
 fn requireError(expected: anyerror, result: anytype, what: []const u8) error{Disagreed}!void {
     if (result) |_| {
         std.debug.print("smoke: disagreed: {s}: expected error.{s}, found a value\n", .{
@@ -113,25 +74,18 @@ fn requireError(expected: anyerror, result: anytype, what: []const u8) error{Dis
     }
 }
 
-/// The environment variables that name a temporary root, in the order they are
-/// consulted: `TMPDIR` on every platform, the Windows spellings after it.
-/// A variable that is unset or empty names no directory.
+/// Temporary-root variables, checked in order; unset or empty values are skipped.
 const temp_root_vars: []const []const u8 = if (builtin.os.tag == .windows)
     &.{ "TMPDIR", "TEMP", "TMP" }
 else
     &.{"TMPDIR"};
 
-/// The directory a scratch environment is created under, as an absolute path:
-/// what the temporary root variable names — taken against the working
-/// directory when it is relative, because `mdb_env_open` is handed an absolute
-/// path — or `.zig-cache/tmp` under the working directory when the environment
-/// names no temporary root at all, which is what `std.testing.tmpDir` uses and
-/// what keeps a host that configures none portable.
+/// Return an absolute scratch root from the environment or `.zig-cache/tmp`.
+/// Resolve relative roots against the working directory for `mdb_env_open`.
 fn scratchRootAlloc(io: std.Io, gpa: std.mem.Allocator, environ: std.process.Environ) ![:0]u8 {
     for (temp_root_vars) |name| {
         const value = environ.getAlloc(gpa, name) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            // Not set, or not a name this platform can spell: try the next.
             error.EnvironmentVariableMissing, error.InvalidWtf8 => continue,
         };
         defer gpa.free(value);
@@ -147,14 +101,8 @@ fn scratchRootAlloc(io: std.Io, gpa: std.mem.Allocator, environ: std.process.Env
     return try std.fs.path.joinZ(gpa, &.{ @as([]const u8, cwd), ".zig-cache", "tmp" });
 }
 
-/// One temporary directory holding one LMDB environment directory.
-///
-/// `std.testing.tmpDir` is compiled only into test binaries, so this mirrors
-/// it: a random name under the temporary root, an absolute path for
-/// `mdb_env_open` — which needs one, and which does not create the directory
-/// itself, because `mdb.c` contains no `mkdir` — and a recursive removal of
-/// that random child and nothing else, which leaves the root and every other
-/// name in it as they were.
+/// Temporary root and random child holding one LMDB environment.
+/// Cleanup removes only the child.
 const Scratch = struct {
     parent: std.Io.Dir,
     sub_path: [sub_path_len]u8,
@@ -172,15 +120,12 @@ const Scratch = struct {
         const root = try scratchRootAlloc(io, gpa, environ);
         defer gpa.free(root);
 
-        // The root is made when it is not there yet. Only the random child
-        // made below it belongs to this program, and only that one is removed.
         const parent = try std.Io.Dir.cwd().createDirPathOpen(io, root, .{});
         errdefer parent.close(io);
         try parent.createDirPath(io, &sub_path);
 
         const path = std.fs.path.joinZ(gpa, &.{ @as([]const u8, root), &sub_path }) catch |err| {
-            // The child is there from here on, so a path that cannot be built
-            // must not leave it behind.
+            // Remove the child if constructing its path fails.
             parent.deleteTree(io, &sub_path) catch {};
             return err;
         };
@@ -197,36 +142,27 @@ const Scratch = struct {
 
 const Record = struct { key: []const u8, value: []const u8 };
 
-/// The records the demonstration stores, in a write order that is not the
-/// order they sort into.
+/// Records inserted out of their sorted order.
 const records = [_]Record{
     .{ .key = "gamma", .value = "third" },
     .{ .key = "alpha", .value = "first" },
     .{ .key = "beta", .value = "second" },
 };
 
-/// The name the duplicates database below is opened under.
+/// Named-database name.
 const sorted_name = "sorted";
 
-/// The key the main database catalogues that name under.
-///
-/// `mdb_dbi_open` measures the name as a C string and then stores that many
-/// bytes of it (mdb.c:12302, :12327-12328), so the key is the name with a
-/// terminator the name does not itself spell.
+/// LMDB stores a named database's catalogue key as its NUL-terminated name.
 const sorted_catalog_key = sorted_name ++ "\x00";
 
-/// The order a forward walk of the main database must produce, written out
-/// with the value each key was stored with rather than keyed against itself:
-/// byte-lexicographic with the shorter item first (mdb.c:6659-6675), and not
-/// the write order above.
+/// Expected main-database cursor order under upstream byte collation.
 const expected_order = [_]Record{
     .{ .key = "alpha", .value = "first" },
     .{ .key = "beta", .value = "second" },
     .{ .key = "gamma", .value = "third" },
 };
 
-/// The duplicates written under one key, again out of order for the same
-/// reason, and the order they must come back in.
+/// Duplicate values and their expected sorted order.
 const duplicates = [_][]const u8{ "delta", "alpha", "gamma", "beta" };
 const expected_duplicates = [_][]const u8{ "alpha", "beta", "delta", "gamma" };
 
@@ -241,25 +177,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
     const out = &stdout.interface;
 
-    // In a runtime-loading build nothing below can run until a provider is
-    // loaded, and the load is the one explicit step the contract asks for. In a
-    // linked build this is a no-op at comptime and the module is already
-    // usable.
     if (comptime lmdb.runtime_loaded) {
         try lmdb.load(.{ .path = try providerRequest(init, gpa) });
     }
 
-    // Read back out of the library rather than from a constant compiled here,
-    // so these two lines name the liblmdb this build actually reached.
     const version = lmdb.version();
     try out.print("lmdb smoke\n", .{});
     try out.print("upstream tag {s}\n", .{upstream_tag});
     const route = if (lmdb.runtime_loaded) "loaded" else "linked";
     try out.print("{s} library version {s}\n", .{ route, lmdb.versionString() });
-    // The three integers `mdb_version` filled, and the text `mdb_strerror`
-    // builds for one of its own negative codes — two more entry points of the
-    // same raw surface, read back out of the library rather than out of a
-    // constant compiled here.
     try out.print("library reports {d}.{d}.{d}; MDB_NOTFOUND is \"{s}\"\n", .{
         version.major,
         version.minor,
@@ -283,9 +209,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try out.flush();
 }
 
-/// Create, configure and open the environment, write the records and the
-/// duplicates, commit, and release everything. The reopen in the next step is
-/// what proves the commit reached the file.
+/// Write records and duplicates, commit, then release the environment.
 fn writeAndCommit(path: [:0]const u8) !void {
     var env = try lmdb.Environment.init(.{
         .path = path,
@@ -307,14 +231,7 @@ fn writeAndCommit(path: [:0]const u8) !void {
     try env.sync(true);
 }
 
-/// The two-phase commit path, and the boundary it draws.
-///
-/// One transaction is prepared and then committed, one is prepared and then
-/// abandoned, and both are checked through a reader that started afterwards.
-/// Between the prepare and the commit or abort nothing else is defined, and the
-/// facade says so rather than letting the C be reached: that refusal is the
-/// first observation here, because it is the one this build's own wrapper
-/// makes.
+/// Prepare then commit or abort transactions, checking which writes become visible.
 fn twoPhaseCommit(path: [:0]const u8, out: *std.Io.Writer) !void {
     var env = try lmdb.Environment.init(.{ .path = path });
     defer env.close();
@@ -335,9 +252,6 @@ fn twoPhaseCommit(path: [:0]const u8, out: *std.Io.Writer) !void {
     defer lost.abort();
     const lost_db = try lost.openDatabase(null, .{});
     try lost.put(lost_db, "prepared-and-abandoned", "lost");
-    // These pages are written before this point, which is what makes abandoning
-    // the transaction the interesting case rather than a write that never
-    // reached the file.
     try lost.prepare();
     lost.abort();
 
@@ -356,9 +270,7 @@ fn twoPhaseCommit(path: [:0]const u8, out: *std.Io.Writer) !void {
     try out.print("prepared: committed record kept, abandoned record absent\n", .{});
 }
 
-/// Reopen read-only — a different environment handle, a different mapping of
-/// the lock file and a different transaction — and check that exactly the
-/// committed bytes came back, in exactly the order the C collates them.
+/// Reopen read-only and verify committed records in cursor order.
 fn readBackAndWalk(path: [:0]const u8, out: *std.Io.Writer) !void {
     var env = try lmdb.Environment.init(.{ .path = path, .flags = .{ .rdonly = true } });
     defer env.close();
@@ -367,8 +279,6 @@ fn readBackAndWalk(path: [:0]const u8, out: *std.Io.Writer) !void {
     defer txn.abort();
     const db = try txn.openDatabase(null, .{});
 
-    // Asked for one key at a time, so what is compared is the value that key
-    // was stored with and not whatever the walk below is standing on.
     for (records) |record| {
         try require(
             std.mem.eql(u8, record.value, try txn.get(db, record.key)),
@@ -386,11 +296,7 @@ fn readBackAndWalk(path: [:0]const u8, out: *std.Io.Writer) !void {
         if (index + 1 < expected_order.len) entry = try cursor.next();
     }
 
-    // A named database is catalogued in the main database, so the walk of the
-    // main database reaches that record as well: 's' collates after 'g', so it
-    // comes last. It is required rather than stepped over, because it is what
-    // the main database holds and a walk that hid it would be walking over
-    // less than the database contains.
+    // Named databases also appear as catalogue records in the main-database walk.
     const catalog = try cursor.next();
     try require(
         std.mem.eql(u8, sorted_catalog_key, catalog.key),
@@ -407,13 +313,8 @@ fn readBackAndWalk(path: [:0]const u8, out: *std.Io.Writer) !void {
     try out.print(" {s}\\0=catalogued, {d} opaque bytes\n", .{ sorted_name, catalog.value.len });
 }
 
-/// A `DUPSORT` database keeps its duplicates sorted. Walk them from both ends
-/// and check the count agrees with what was written.
+/// Check sorted traversal and count for duplicate values.
 fn duplicatesUnderOneKey(path: [:0]const u8, out: *std.Io.Writer) !void {
-    // The slot table is not part of the environment file: `mdb_env_create`
-    // sizes it to the two databases upstream keeps for itself (mdb.c:5028)
-    // and only `mdb_env_set_maxdbs` grows it, so this reopen asks again
-    // exactly as `writeAndCommit` did (lmdb.h:1326-1327, mdb.c:12316-12318).
     var env = try lmdb.Environment.init(.{
         .path = path,
         .max_dbs = 1,
@@ -428,8 +329,6 @@ fn duplicatesUnderOneKey(path: [:0]const u8, out: *std.Io.Writer) !void {
     var cursor = try txn.openCursor(db);
     defer cursor.close();
 
-    // FIRST_DUP and LAST_DUP are EINVAL until the cursor is on a key
-    // (mdb.c:8467-8469), so the walk starts from the key itself.
     try requireError(
         error.InvalidArgument,
         cursor.firstDup(),
@@ -482,7 +381,7 @@ fn duplicatesUnderOneKey(path: [:0]const u8, out: *std.Io.Writer) !void {
     try out.print("\n", .{});
 }
 
-/// The boundaries that are errors rather than values.
+/// Check boundary errors from the native facade.
 fn boundariesAndErrors(path: [:0]const u8, out: *std.Io.Writer) !void {
     var env = try lmdb.Environment.init(.{ .path = path });
     defer env.close();
@@ -514,9 +413,7 @@ fn boundariesAndErrors(path: [:0]const u8, out: *std.Io.Writer) !void {
     );
     try txn.delete(db, "delta");
 
-    // Abandon everything and release the handle. The deferred abort that
-    // follows is a no-op, which is the point of clearing the handle in both
-    // commit and abort rather than only in one of them.
+    // Aborting spends the handle, so later operations return `TransactionClosed`.
     txn.abort();
     try require(
         if (txn.get(db, "alpha")) |_| false else |err| err == error.TransactionClosed,
@@ -549,10 +446,7 @@ fn boundariesAndErrors(path: [:0]const u8, out: *std.Io.Writer) !void {
     try out.print("boundaries NotFound KeyExists EmptyKey TransactionClosed IsReadOnly\n", .{});
 }
 
-/// The borrowing rule the header states in prose (lmdb.h:1521-1526): the bytes
-/// a read returns belong to the map, so two reads with nothing written between
-/// them hand back the same address rather than a fresh copy, and they are
-/// still there after other keys have been read.
+/// Verify that reads borrow stable memory-map bytes until an update or transaction end.
 fn borrowFromTheMap(path: [:0]const u8, out: *std.Io.Writer) !void {
     var env = try lmdb.Environment.init(.{ .path = path, .flags = .{ .rdonly = true } });
     defer env.close();
@@ -564,8 +458,6 @@ fn borrowFromTheMap(path: [:0]const u8, out: *std.Io.Writer) !void {
     const first = try txn.get(db, "alpha");
     try require(std.mem.eql(u8, "first", first), "the borrowed bytes are the stored ones");
 
-    // A read of another key may fault pages in; it must not invalidate or
-    // relocate the slice already handed out.
     const other = try txn.get(db, "gamma");
     try require(std.mem.eql(u8, "third", other), "the other key reads back too");
     try require(std.mem.eql(u8, "first", first), "the first slice still reads correctly afterwards");

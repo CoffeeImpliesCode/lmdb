@@ -1,59 +1,31 @@
 .{
-    // The name a dependent package writes in `b.dependency("lmdb", .{})`,
-    // and the prefix of the module it then reaches through
-    // `dep.module("lmdb")`.
+    // Dependency and module name.
     .name = .lmdb,
-    // The upstream LMDB release this fork carries. lmdb.h:235-239 declares
-    // MDB_VERSION_MAJOR/MINOR/PATCH as 1, 0 and 1 at that commit, and
-    // build.zig refuses to configure if this string drifts away from the
-    // version it pins there.
+    // Upstream release, checked against the build pin.
     .version = "1.0.1",
-    // Identifies this package unambiguously. Changing this has security and
-    // trust implications.
     .fingerprint = 0xb2966103cdac27b5,
     .minimum_zig_version = "0.16.0",
-    // The library is the three upstream C translation units in this
-    // repository. There is no Zig dependency and there is nothing to fetch at
-    // build time.
     .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        // The aggregate header handed to addTranslateC. It is fork-authored
-        // and lives at the package root, so the upstream tree under
-        // libraries/liblmdb stays byte-for-byte upstream's.
+        // Header translated by the Zig facade.
         "translate.h",
-        // The Zig facade, and its behavioural tests and deterministic smoke
-        // program.
+        // Zig facade and tests.
         "zig",
-        // The runtime route, and it is load-bearing rather than optional:
-        // `build.zig` imports `runtime/graph.zig` in *every* configuration, so
-        // a package without this directory cannot configure at all. Inside it,
-        // `graph.zig` and `library.zig` are this fork's own dispatch and ABI
-        // record, `loader.zig`/`generate.zig`/`sync.c`/`sync.h` are the reusable
-        // loader core that every SDK carries the same copy of, and the whole
-        // directory ships because `graph.zig` names all six of them by path.
+        // Runtime loader used by every build configuration.
         "runtime",
         "tests.zig",
         "smoke.zig",
-        // cross-test reads this settings-only profile from the package root to
-        // drive `zig build test -Dtarget=TARGET` over the full published
-        // platform matrix. It is Bash, not documentation, so it is listed.
+        // Cross-test profile.
         "cross-test.profile.sh",
-        // Tests read a known-answer corpus from here with @embedFile, and
-        // testdata/interop.zig is the reference interoperability program: the
-        // `check` step compiles it for every target of the matrix, and the
-        // `interop` step runs it against an upstream mdb_dump built from this
-        // same package.
+        // Test corpus and interoperability source.
         "testdata",
-        // The separate consumer package. It lives inside this repository so the
-        // dependency it proves is a relative path that resolves without a
-        // registry entry or a network fetch.
+        // Separate consumer package.
         "consumer/build.zig",
         "consumer/build.zig.zon",
         "consumer/src/main.zig",
-        // Full pinned native library, tools, headers, build definitions and
-        // legal records. UPSTREAM.sha256 covers the same immutable tree.
+        // Pinned upstream source tree.
         "libraries/liblmdb",
         "UPSTREAM.md",
         "UPSTREAM.sha256",
@@ -61,26 +33,12 @@
         "FORK-NOTES.md",
         "CHANGELOG.md",
         "NOTICE.md",
-        // The fork's own documentation and the standalone Nix and shell
-        // interface that documentation describes. `package.nix` is the single
-        // source-only derivation both `flake.nix` and `devenv.nix` call, so a
-        // consumer who received only this package could still build it with
-        // Nix; `.envrc` and `devenv.yaml` belong with them for the same reason.
-        // There is no `README.upstream.md` here and there will not be one:
-        // upstream's tree at the pinned commit carries no README at any depth,
-        // so there are no upstream README bytes to preserve separately, and
-        // README.md is the fork's own text from its first line.
+        // Fork documentation and Nix/devenv integration files.
         "README.md",
         "FORK-LICENSE.md",
         "package.nix",
         "flake.nix",
-        // `flake.lock` resolves `flake.nix`'s one input at the commit that file
-        // already names, and it travels with it: a package fetched through
-        // `.paths` that received `flake.nix` without its lock would resolve a
-        // floating input, which is exactly what the pin exists to prevent.
-        // `devenv.lock` is deliberately **not** listed — it does not exist in
-        // this tree and was not invented, so listing it would name a file no
-        // dependent could receive.
+        // Pin for the flake input.
         "flake.lock",
         "devenv.nix",
         "devenv.yaml",

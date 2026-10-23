@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: OLDAP-2.8
 #
-# The one input this SDK's canonical development shell resolves. Pinned to a
-# commit, not to a branch, so `devenv shell` builds the same package set twice.
-#
-# There is no devenv.lock in this tree and this file does not invent one: the
-# lock is the driver's to create from this input.
 inputs:
   nixpkgs:
     url: github:cachix/devenv-nixpkgs/c2f38fe7f9e04d9aadd354d380f2bd40531d9737
