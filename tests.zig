@@ -67,7 +67,7 @@ fn scratchRootAlloc(environ: std.process.Environ) ![:0]u8 {
         };
         defer gpa.free(value);
         if (value.len == 0) continue;
-        if (std.fs.path.isAbsolute(value)) return try gpa.dupeZ(u8, value);
+        if (std.fs.path.isAbsolute(value)) return try gpa.dupeSentinel(u8, value, 0);
         const cwd = try std.process.currentPathAlloc(io, gpa);
         defer gpa.free(cwd);
         return try std.fs.path.joinZ(gpa, &.{ @as([]const u8, cwd), value });
@@ -842,9 +842,9 @@ test "a file that is not an environment is refused, and the handle is spent by t
     var box = try Sandbox.init();
     defer box.deinit();
 
-    const data_path = try std.fmt.allocPrintSentinel(gpa, "{s}/data.mdb", .{box.path}, 0);
+    const data_path = try gpa.printSentinel("{s}/data.mdb", .{box.path}, 0);
     defer gpa.free(data_path);
-    const junk = [_]u8{0xff} ** 1024;
+    const junk: [1024]u8 = @splat(0xff);
     const not_an_env = try std.Io.Dir.createFileAbsolute(io, data_path, .{});
     try not_an_env.writeStreamingAll(io, &junk);
     not_an_env.close(io);

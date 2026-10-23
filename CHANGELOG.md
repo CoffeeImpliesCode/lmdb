@@ -1,5 +1,8 @@
 # Changelog
 
+- Port to Zig 0.17.0.
+- The nested `consumer` step uses its own install prefix and runs only for host-native targets under Zig 0.17.
+
 Fork-only changes relative to LMDB 1.0.1 (`LMDB_1.0.1`, commit `6f0a32496a5aadee15a5e5103c479bd3355ae273`); upstream history remains in `libraries/liblmdb/CHANGES`.
 
 - 2026-10-04 — `listReaders` returns `mdb_reader_list` callback values unchanged; callback results are not LMDB status codes.

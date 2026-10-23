@@ -98,7 +98,7 @@ const Scratch = struct {
 
         // LMDB requires an absolute path.
         const absolute_root = if (std.fs.path.isAbsolute(root))
-            try gpa.dupeZ(u8, root)
+            try gpa.dupeSentinel(u8, root, 0)
         else blk: {
             const cwd = try std.process.currentPathAlloc(io, gpa);
             defer gpa.free(cwd);

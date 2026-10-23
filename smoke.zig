@@ -90,7 +90,7 @@ fn scratchRootAlloc(io: std.Io, gpa: std.mem.Allocator, environ: std.process.Env
         };
         defer gpa.free(value);
         if (value.len == 0) continue;
-        if (std.fs.path.isAbsolute(value)) return try gpa.dupeZ(u8, value);
+        if (std.fs.path.isAbsolute(value)) return try gpa.dupeSentinel(u8, value, 0);
         const cwd = try std.process.currentPathAlloc(io, gpa);
         defer gpa.free(cwd);
         return try std.fs.path.joinZ(gpa, &.{ @as([]const u8, cwd), value });

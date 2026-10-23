@@ -2,9 +2,9 @@
 #
 # The flake pins its input; devenv resolves its separate input.
 {
-  description = "LMDB, the Lightning Memory-Mapped Database, built from this repository's pinned upstream C with Zig 0.16";
+  description = "LMDB, the Lightning Memory-Mapped Database, built from this repository's pinned upstream C with Zig 0.17";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/c7def046b9a883d46974757852106483d741586f";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/02c087f3fe673c9e317f206a627cb6b910336dbe";
 
   outputs =
     { self, nixpkgs }:
@@ -20,7 +20,7 @@
 
       mk = system: linkage:
         let pkgs = nixpkgs.legacyPackages.${system};
-        in pkgs.callPackage ./package.nix { zig = pkgs.zig_0_16; inherit linkage; };
+        in pkgs.callPackage ./package.nix { zig = pkgs.zig_0_17; inherit linkage; };
     in
     {
       packages = forAllSystems (

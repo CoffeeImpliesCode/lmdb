@@ -4,7 +4,7 @@
     // Upstream release, checked against the build pin.
     .version = "1.0.1",
     .fingerprint = 0xb2966103cdac27b5,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",

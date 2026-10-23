@@ -4,7 +4,7 @@
 { pkgs, ... }:
 
 let
-  mk = linkage: pkgs.callPackage ./package.nix { zig = pkgs.zig_0_16; inherit linkage; };
+  mk = linkage: pkgs.callPackage ./package.nix { zig = pkgs.zig_0_17; inherit linkage; };
 
   # Use the working-tree root for tasks instead of copying the SDK into the store.
   sdkRootArg = pkgs.lib.escapeShellArg (builtins.toString ./.);
@@ -50,7 +50,7 @@ echo "${task}: install prefix $lmdb_prefix" >&2
 in
 {
   packages = [
-    pkgs.zig_0_16
+    pkgs.zig_0_17
     pkgs.pkg-config
     pkgs.bash
   ];
@@ -199,7 +199,7 @@ in
     # Use devenv's plural `tasks run` and `tasks list` commands.
     cat <<'EOF'
     lmdb 1.0.1 — development shell
-      tools    zig 0.16.0, pkg-config, bash
+      tools    zig 0.17.0, pkg-config, bash
       gates    devenv tasks run
                  lmdb:build | lmdb:test | lmdb:test-release-safe | lmdb:smoke
                  | lmdb:check | lmdb:interop | lmdb:consumer | lmdb:integrity

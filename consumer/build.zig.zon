@@ -5,7 +5,7 @@
     // package with a different name. It exists to prove that the library's
     // published module can be consumed by a package that did not write it.
     .fingerprint = 0xa04d1fdf771fe19f, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // A relative path, not a registry or archive URL. The consumer is the
         // proof that `dep.module("lmdb")` works from outside the package that

@@ -222,18 +222,18 @@ fn positiveStatus(rc: c_int) Error {
 /// Map POSIX status codes returned by upstream.
 fn posixStatus(rc: c_int) Error {
     return switch (rc) {
-        @intFromEnum(Errno.ACCES) => error.AccessDenied,
-        @intFromEnum(Errno.PERM) => error.AccessDenied,
-        @intFromEnum(Errno.INVAL) => error.InvalidArgument,
-        @intFromEnum(Errno.NOMEM) => error.OutOfMemory,
-        @intFromEnum(Errno.NOSPC) => error.NoSpaceLeft,
-        @intFromEnum(Errno.IO) => error.InputOutput,
-        @intFromEnum(Errno.NOENT) => error.NoSuchFileOrDirectory,
-        @intFromEnum(Errno.AGAIN) => error.WouldBlock,
-        @intFromEnum(Errno.DEADLK) => error.WouldBlock,
-        @intFromEnum(Errno.MFILE) => error.TooManyOpenFiles,
-        @intFromEnum(Errno.NFILE) => error.TooManyOpenFiles,
-        @intFromEnum(Errno.ROFS) => error.ReadOnlyFileSystem,
+        @backingInt(Errno.ACCES) => error.AccessDenied,
+        @backingInt(Errno.PERM) => error.AccessDenied,
+        @backingInt(Errno.INVAL) => error.InvalidArgument,
+        @backingInt(Errno.NOMEM) => error.OutOfMemory,
+        @backingInt(Errno.NOSPC) => error.NoSpaceLeft,
+        @backingInt(Errno.IO) => error.InputOutput,
+        @backingInt(Errno.NOENT) => error.NoSuchFileOrDirectory,
+        @backingInt(Errno.AGAIN) => error.WouldBlock,
+        @backingInt(Errno.DEADLK) => error.WouldBlock,
+        @backingInt(Errno.MFILE) => error.TooManyOpenFiles,
+        @backingInt(Errno.NFILE) => error.TooManyOpenFiles,
+        @backingInt(Errno.ROFS) => error.ReadOnlyFileSystem,
         else => error.UnexpectedStatus,
     };
 }
@@ -1235,7 +1235,7 @@ pub const Cursor = struct {
             .mv_size = 0,
             .mv_data = undefined,
         };
-        try check(c.mdb_cursor_get(handle, &key, &value, @intFromEnum(op)));
+        try check(c.mdb_cursor_get(handle, &key, &value, @backingInt(op)));
         return .{ .key = borrowed(key), .value = borrowed(value) };
     }
 

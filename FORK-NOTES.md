@@ -28,6 +28,8 @@
 - Loader dependencies are attached to the core module: Linux uses `dl`, Windows uses `kernel32`, and Darwin needs no extra loader library. Static pkg-config metadata carries private loader dependencies.
 - `-Druntime=true` generates a dispatch from the translated header and leaves the LMDB library unlinked; `lmdb.load` resolves the provider at runtime. The linked route uses the same translated facade without the dispatch.
 - `check` compiles the core, facade, tests, smoke program, and interoperability program for its target set. The separate `interop` step builds upstream's `mdb_dump` from this tree and compares its deterministic output body with the fixture.
+- The nested consumer build keeps its own default install prefix and runs only host-native targets; Zig 0.17 does not expose a resolved install-prefix string or external-executor toggles in build configuration.
+- Zig 0.17 nested builds receive cache and standard-library paths through `ZIG_GLOBAL_CACHE_DIR` and `ZIG_LIB_DIR`, not removed build flags.
 
 ## Platform boundaries
 

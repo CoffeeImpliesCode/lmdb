@@ -7,7 +7,7 @@ pub fn build(b: *std.Build) void {
 
     // Match the parent package's linkage and runtime defaults.
     const linkage = b.option(
-        std.builtin.LinkMode,
+        std.lang.LinkMode,
         "linkage",
         "Which delivery form of the library to consume: a static archive (default) or a shared library",
     ) orelse .static;
@@ -56,6 +56,6 @@ pub fn build(b: *std.Build) void {
     // Forward caller arguments after the build runner's `--`.
     if (scratch) |dir| run_exe.addArgs(&.{ "--scratch", dir });
     if (provider) |path| run_exe.addArgs(&.{ "--provider", path });
-    if (b.args) |args| run_exe.addArgs(args);
+    run_exe.addPassthruArgs();
     run_step.dependOn(&run_exe.step);
 }

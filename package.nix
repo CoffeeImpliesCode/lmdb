@@ -78,7 +78,7 @@ stdenv.mkDerivation {
   };
 
   meta = {
-    description = "LMDB, the Lightning Memory-Mapped Database, built from this repository's pinned upstream C with Zig 0.16 — ${linkage} variant";
+    description = "LMDB, the Lightning Memory-Mapped Database, built from this repository's pinned upstream C with Zig 0.17 — ${linkage} variant";
     homepage = "https://github.com/LMDB/lmdb";
     license = lib.licenses.openldap;
     platforms = lib.platforms.unix;

@@ -90,7 +90,7 @@ const c_flags = [_][]const u8{
 };
 
 /// Shared non-Windows builds add PIC; static builds use the default flags.
-fn coreCFlags(linkage: std.builtin.LinkMode, os_tag: std.Target.Os.Tag) []const []const u8 {
+fn coreCFlags(linkage: std.lang.LinkMode, os_tag: std.Target.Os.Tag) []const []const u8 {
     if (linkage == .dynamic and os_tag != .windows) return &.{ "-std=gnu17", "-fPIC" };
     return &c_flags;
 }
@@ -264,11 +264,11 @@ const LmdbPackage = struct {
 
 const LmdbOptions = struct {
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     /// Linkage for the bundled artifact.
-    linkage: std.builtin.LinkMode,
+    linkage: std.lang.LinkMode,
     /// Linkage requested from an installed system library.
-    system_linkage: std.builtin.LinkMode,
+    system_linkage: std.lang.LinkMode,
 
     /// Resolve C symbols at runtime instead of linking them.
     runtime_loaded: bool,
@@ -290,10 +290,10 @@ fn preprocessedHeader(b: *std.Build, options: LmdbOptions) std.Build.LazyPath {
         run.addArg(triple);
     }
     // Include the bundled header; the preprocessed input has no includes left.
-    run.addPrefixedDirectoryArg("-I", b.path(upstream.source_dir));
+    run.addDirectoryArg2(b.path(upstream.source_dir), .{ .prefix = "-I" });
     run.addArg("-o");
-    const preprocessed = run.addOutputFileArg("lmdb_preprocessed.c");
-    run.addFileArg(b.path(translate_header));
+    const preprocessed = run.addOutputFileArg2("lmdb_preprocessed.c", .{});
+    run.addFileArg2(b.path(translate_header), .{});
     return preprocessed;
 }
 
@@ -402,8 +402,8 @@ fn addTargetCheck(
     b: *std.Build,
     step: *std.Build.Step,
     query: std.Target.Query,
-    optimize: std.builtin.OptimizeMode,
-    linkage: std.builtin.LinkMode,
+    optimize: std.lang.Optimize,
+    linkage: std.lang.LinkMode,
     runtime_loaded: bool,
 ) error{UnsupportedTarget}!void {
     const triple = query.zigTriple(b.allocator) catch @panic("OOM");
@@ -463,8 +463,8 @@ fn addInterop(
     b: *std.Build,
     step: *std.Build.Step,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    linkage: std.builtin.LinkMode,
+    optimize: std.lang.Optimize,
+    linkage: std.lang.LinkMode,
     runtime_loaded: bool,
 ) error{UnsupportedTarget}!void {
     const backend = lockBackend(target.result.os.tag) orelse
@@ -518,7 +518,7 @@ fn addInterop(
     const run_interop = b.addRunArtifact(interop);
     run_interop.setName("mdb_dump interoperability");
     // Pass the artifact path as one argument.
-    run_interop.addPrefixedArtifactArg("--dump=", reference);
+    run_interop.addArtifactArg2(reference, .{ .prefix = "--dump=" });
     // The run mutates a scratch environment.
     run_interop.has_side_effects = true;
     step.dependOn(&run_interop.step);
@@ -559,7 +559,7 @@ fn pkgConfigPrivateLibs(b: *std.Build, os_tag: std.Target.Os.Tag) []const u8 {
 fn pkgConfigFile(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    linkage: std.builtin.LinkMode,
+    linkage: std.lang.LinkMode,
 ) std.Build.LazyPath {
     // Include the installed header; omit -pthread on Windows.
     const cflags: []const u8 = if (target.result.os.tag == .windows)
@@ -625,14 +625,13 @@ fn parseTriple(b: *std.Build, triple: []const u8) std.Target.Query {
     };
 }
 
-/// Runs the separate consumer package against this package's public module.
-/// Forwards target, build shape, integration mode, caches, and install prefix.
-/// Runs the program only when an executor can execute the target.
+/// Builds the consumer package against the public module.
+/// Runs it only when the target is host-native.
 fn runConsumer(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    linkage: std.builtin.LinkMode,
+    optimize: std.lang.Optimize,
+    linkage: std.lang.LinkMode,
     runtime_loaded: bool,
     use_system: bool,
     scratch: ?[]const u8,
@@ -661,64 +660,34 @@ fn runConsumer(
     // Forward caller-supplied scratch and provider paths only.
     if (scratch) |dir| run.addArg(b.fmt("-Dscratch={s}", .{dir}));
     if (provider) |path| run.addArg(b.fmt("-Dprovider={s}", .{path}));
-    // Match the outer build's enabled executors and libc runtime directory.
-    if (b.enable_darling) run.addArg("-fdarling");
-    if (b.enable_qemu) run.addArg("-fqemu");
-    if (b.enable_rosetta) run.addArg("-frosetta");
-    if (b.enable_wasmtime) run.addArg("-fwasmtime");
-    if (b.enable_wine) run.addArg("-fwine");
-    if (b.libc_runtimes_dir) |runtimes| run.addArgs(&.{ "--libc-runtimes", runtimes });
     // Keep nested builds on the same job width and summary settings.
     run.addArg("-j8");
     run.addArgs(&.{ "--summary", "all" });
     // Use a separate local cache for the consumer package.
-    if (b.cache_root.path) |cache| {
-        run.addArg("--cache-dir");
-        run.addArg(b.fmt("{s}/consumer", .{cache}));
+    run.addArg("--cache-dir");
+    _ = run.addOutputDirectoryArg2("consumer-cache", .{ .make_absolute = true });
+    for ([_][]const u8{ "ZIG_GLOBAL_CACHE_DIR", "ZIG_LIB_DIR" }) |name| {
+        if (b.graph.environ_map.get(name)) |value| run.setEnvironmentVariable(name, value);
     }
-    // Forward the build runner's selected global cache.
-    run.addArg("--global-cache-dir");
-    run.addArg(b.graph.global_cache_root.path orelse
-        @panic("build.zig: no global cache directory was set by the build runner"));
-    // Forward the resolved install prefix as an absolute path.
-    const default_prefix = b.build_root.join(b.allocator, &.{"zig-out"}) catch @panic("OOM");
-    if (!std.mem.eql(u8, b.install_prefix, default_prefix)) {
-        const prefix = if (std.fs.path.isAbsolute(b.install_prefix))
-            b.install_prefix
-        else
-            b.pathJoin(&.{ b.graph.cache.cwd, b.install_prefix });
-        run.addArg("--prefix");
-        run.addArg(prefix);
-    }
-    // Forward caller arguments after the build separator.
-    if (b.args) |args| {
-        run.addArg("--");
-        run.addArgs(args);
-    }
+    // Separate nested build options from arguments passed to its run step.
+    run.addArg("--");
+    run.addPassthruArgs();
     run.has_side_effects = true;
     return run;
 }
 
-/// Returns whether this host can execute the target with enabled executors.
-/// QEMU requires a libc runtime directory for GNU libc targets.
+/// Returns whether the target can run natively on this host.
 fn hostCanExecute(b: *std.Build, target: std.Build.ResolvedTarget) bool {
     const host = &b.graph.host.result;
-    const candidate = &target.result;
     const options: std.zig.system.GetExternalExecutorOptions = .{
-        .allow_darling = b.enable_darling,
-        .allow_qemu = b.enable_qemu,
-        .allow_wasmtime = b.enable_wasmtime,
-        .allow_wine = b.enable_wine,
-        .qemu_fixes_dl = candidate.isGnuLibC() and b.libc_runtimes_dir != null,
+        .host_cpu_arch = host.cpu.arch,
+        .host_os_tag = host.os.tag,
+        .link_mode = .dynamic,
         .link_libc = true,
     };
-    return switch (std.zig.system.getExternalExecutor(b.graph.io, host, candidate, options)) {
-        .native, .rosetta => true,
-        // QEMU needs libc runtime files for GNU libc targets.
-        // Match the build runner's cross-libc requirement.
-        .qemu => !candidate.isGnuLibC() or b.libc_runtimes_dir != null,
-        .wine, .wasmtime, .darling => true,
-        .bad_dl, .bad_os_or_cpu => false,
+    return switch (std.zig.system.getExternalExecutor(b.graph.io, &target.result, options)) {
+        .native => true,
+        else => false,
     };
 }
 
@@ -736,7 +705,7 @@ pub fn build(b: *std.Build) !void {
 
     // Select the library artifact form; static is the default.
     const linkage_option = b.option(
-        std.builtin.LinkMode,
+        std.lang.LinkMode,
         "linkage",
         "Build the LMDB artifact as a static archive (default) or as a shared library; named, it is also the preference -fsys=lmdb binds an installed liblmdb with",
     );
@@ -862,7 +831,7 @@ pub fn build(b: *std.Build) !void {
     const run_smoke = b.addRunArtifact(smoke);
     const smoke_step = b.step("smoke", "Run the deterministic smoke program");
     smoke_step.dependOn(&run_smoke.step);
-    if (b.args) |args| run_smoke.addArgs(args);
+    run_smoke.addPassthruArgs();
 
     // Compile the selected target or full supported matrix without running binaries.
     const check_step = b.step(
@@ -900,7 +869,7 @@ pub fn build(b: *std.Build) !void {
     );
     const consumer_step = b.step(
         "consumer",
-        "Build the consumer package in consumer/ against dep.module(\"lmdb\"), and run it when this host can execute the selected target",
+        "Build the consumer package in consumer/ against dep.module(\"lmdb\"); run it only for a native target",
     );
     consumer_step.dependOn(&runConsumer(
         b,
