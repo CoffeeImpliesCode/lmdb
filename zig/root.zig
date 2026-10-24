@@ -970,13 +970,13 @@ pub const Transaction = struct {
         return bits;
     }
 
-/// Return the C-reported environment handle borrowed by this transaction.
+    /// Return the C-reported environment handle borrowed by this transaction.
     pub fn environment(self: *Transaction) Error!*c.MDB_env {
         const handle = try self.active();
         return c.mdb_txn_env(handle) orelse error.UnexpectedStatus;
     }
 
-/// Return page and tree statistics for a named database.
+    /// Return page and tree statistics for a named database.
     pub fn statistics(self: *Transaction, db: Database) Error!Statistics {
         var raw: c.MDB_stat = undefined;
         try check(c.mdb_stat(try self.active(), db.dbi, &raw));
@@ -990,37 +990,37 @@ pub const Transaction = struct {
         };
     }
 
-/// Return the flags this database was created with.
+    /// Return the flags this database was created with.
     pub fn databaseFlags(self: *Transaction, db: Database) Error!c_uint {
         var bits: c_uint = 0;
         try check(c.mdb_dbi_flags(try self.active(), db.dbi, &bits));
         return bits;
     }
 
-/// Empty a database or delete a named database and close its handle; the main database can only be emptied.
-/// Read-only returns `IsReadOnly`; do not close a handle deleted by this call.
+    /// Empty a database or delete a named database and close its handle; the main database can only be emptied.
+    /// Read-only returns `IsReadOnly`; do not close a handle deleted by this call.
     pub fn drop(self: *Transaction, db: Database, delete_database: bool) Error!void {
         try check(c.mdb_drop(try self.active(), db.dbi, if (delete_database) 1 else 0));
     }
 
-/// Install the key comparator before data access and use it in every program that opens this database.
-/// The callback must not re-enter the environment or retain its map-backed arguments.
+    /// Install the key comparator before data access and use it in every program that opens this database.
+    /// The callback must not re-enter the environment or retain its map-backed arguments.
     pub fn setKeyComparator(self: *Transaction, db: Database, comparator: KeyComparator) Error!void {
         try check(c.mdb_set_compare(try self.active(), db.dbi, comparator));
     }
 
-/// Install the duplicate-value comparator before data access; all programs must use the same function.
-/// It is stored for any database but affects normal operations only with `DUPSORT`.
+    /// Install the duplicate-value comparator before data access; all programs must use the same function.
+    /// It is stored for any database but affects normal operations only with `DUPSORT`.
     pub fn setValueComparator(self: *Transaction, db: Database, comparator: KeyComparator) Error!void {
         try check(c.mdb_set_dupsort(try self.active(), db.dbi, comparator));
     }
 
-/// Record a fixed-map relocation callback; upstream marks this feature unimplemented.
+    /// Record a fixed-map relocation callback; upstream marks this feature unimplemented.
     pub fn setRelocation(self: *Transaction, db: Database, relocation: RelocationCallback) Error!void {
         try check(c.mdb_set_relfunc(try self.active(), db.dbi, relocation));
     }
 
-/// Store a caller-owned relocation context pointer; it is neither copied nor freed.
+    /// Store a caller-owned relocation context pointer; it is neither copied nor freed.
     pub fn setRelocationContext(
         self: *Transaction,
         db: Database,
@@ -1029,7 +1029,7 @@ pub const Transaction = struct {
         try check(c.mdb_set_relctx(try self.active(), db.dbi, context));
     }
 
-/// Compare keys with the database comparator; return ordering, not a status.
+    /// Compare keys with the database comparator; return ordering, not a status.
     pub fn compareKeys(self: *Transaction, db: Database, a: []const u8, b: []const u8) Error!c_int {
         const handle = try self.active();
         const left = dataValue(a);
@@ -1037,8 +1037,8 @@ pub const Transaction = struct {
         return c.mdb_cmp(handle, db.dbi, &left, &right);
     }
 
-/// Compare duplicate values with the database comparator; return ordering, not a status.
-/// Requires `DUPSORT`; without it upstream calls a null comparator.
+    /// Compare duplicate values with the database comparator; return ordering, not a status.
+    /// Requires `DUPSORT`; without it upstream calls a null comparator.
     pub fn compareValues(self: *Transaction, db: Database, a: []const u8, b: []const u8) Error!c_int {
         const handle = try self.active();
         const left = dataValue(a);
@@ -1046,7 +1046,7 @@ pub const Transaction = struct {
         return c.mdb_dcmp(handle, db.dbi, &left, &right);
     }
 
-/// Return a usable native handle or the closed, reset or prepared error.
+    /// Return a usable native handle or the closed, reset or prepared error.
     fn active(self: *Transaction) Error!*c.MDB_txn {
         const handle = self.handle orelse return error.TransactionClosed;
         if (self.suspended) return error.TransactionReset;
@@ -1054,7 +1054,7 @@ pub const Transaction = struct {
         return handle;
     }
 
-/// Take the handle before a C call frees it; prepared transactions remain spendable.
+    /// Take the handle before a C call frees it; prepared transactions remain spendable.
     fn take(self: *Transaction) Error!*c.MDB_txn {
         const handle = self.handle orelse return error.TransactionClosed;
         if (self.suspended) return error.TransactionReset;
