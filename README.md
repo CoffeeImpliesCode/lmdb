@@ -28,12 +28,10 @@ LMDB 1.0.1 is the Lightning Memory-Mapped Database. This package wraps its upstr
 
 ## Consumption
 
-A local dependency in `build.zig.zon`:
+Fetch the package from GitHub:
 
-```zig
-.dependencies = .{
-    .lmdb = .{ .path = "../lmdb" },
-},
+```sh
+zig fetch --save git+https://github.com/CoffeeImpliesCode/lmdb#v1.0.1
 ```
 
 Import the facade module:
